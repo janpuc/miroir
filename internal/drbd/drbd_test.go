@@ -515,6 +515,48 @@ func TestApplyRecreatesOnMissingMetadata(t *testing.T) {
 	}
 }
 
+// An auto-diskful conversion is already up in the kernel as a diskless
+// Primary client while the backing it is gaining is still blank. The
+// resource's presence must not be read as live metadata: create-md has to
+// run, or adjust attaches a device with no metadata on it and the leg
+// never materializes (it error-loops "No valid meta data found" forever).
+func TestApplySeedsMetadataForDisklessLegGainingADisk(t *testing.T) {
+	fe := &fakeExec{responses: map[string]string{
+		cmdDrbdsetupStatus: `[{"name":"` + volPvc1 + `","role":"Primary",
+			"devices":[{"disk-state":"Diskless"}],
+			"connections":[{"peer-node-id":1,"connection-state":"Connected",
+			"peer_devices":[{"peer-disk-state":"UpToDate"}]}]}]`,
+	}}
+	d := &Driver{StateDir: t.TempDir(), Exec: fe.run, Mknod: fakeMknod}
+
+	if err := d.Apply(t.Context(), testResource(nodeA)); err != nil {
+		t.Fatal(err)
+	}
+	fe.calledWith(t, "drbdadm create-md --force --max-peers 7 pvc-1/0")
+	if _, err := os.Stat(filepath.Join(d.StateDir, "pvc-1.md-adopted")); !os.IsNotExist(err) {
+		t.Fatal("a blank backing must not be recorded as adopted metadata")
+	}
+}
+
+// The converse guard: a leg whose own disk is attached is live. Its
+// metadata must still be adopted untouched — dump-md against it could only
+// report EBUSY, which is why the kernel is asked first at all.
+func TestApplyAdoptsAttachedLocalDisk(t *testing.T) {
+	fe := &fakeExec{responses: map[string]string{
+		cmdDrbdsetupStatus: `[{"name":"` + volPvc1 + `","role":"Primary",
+			"devices":[{"disk-state":"UpToDate"}],"connections":[]}]`,
+	}}
+	d := &Driver{StateDir: t.TempDir(), Exec: fe.run, Mknod: fakeMknod}
+
+	if err := d.Apply(t.Context(), testResource(nodeA)); err != nil {
+		t.Fatal(err)
+	}
+	fe.notCalledWith(t, "create-md")
+	if _, err := os.Stat(filepath.Join(d.StateDir, "pvc-1.md-adopted")); err != nil {
+		t.Fatal("attached metadata must be adopted, not recreated")
+	}
+}
+
 func TestApplyIdempotent(t *testing.T) {
 	fe := &fakeExec{}
 	d := &Driver{StateDir: t.TempDir(), Exec: fe.run, Mknod: fakeMknod}
@@ -579,7 +621,8 @@ func TestApplyAdoptsAttachedDevice(t *testing.T) {
 	// warning; the refusal form covers metadata-modifying probes.
 	for name, fe := range map[string]*fakeExec{
 		"kernel has resource": {responses: map[string]string{
-			"drbdsetup status pvc-1": "pvc-1 role:Secondary\n  disk:Inconsistent",
+			cmdDrbdsetupStatus: `[{"name":"` + volPvc1 + `","role":"Secondary",
+				"devices":[{"disk-state":"Inconsistent"}],"connections":[]}]`,
 		}},
 		"stale warning": {responses: map[string]string{
 			cmdDumpMD: "# Output might be stale, since minor 1000 is attached\ncurrent-uuid 0x0000000000000004;",

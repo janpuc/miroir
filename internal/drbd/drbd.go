@@ -250,11 +250,24 @@ func InternalMetaOverhead(sizeBytes int64) int64 {
 // Kernel state is probed first: an attached resource claims its backing
 // device exclusively, so dump-md only reports EBUSY — the same error a
 // foreign holder (stale mount, LVM) produces. Asking the kernel
-// disambiguates: resource present → attached; absent → any remaining
+// disambiguates: local disk attached → attached; otherwise any remaining
 // busy error is a foreign holder and surfaces.
+//
+// The probe keys on this node's own disk state, not the resource's mere
+// presence in the kernel. A leg converting diskless→diskful (auto-diskful)
+// is already up as a diskless client while the backing it is about to gain
+// is still blank — it holds no backing device, so nothing claims the disk
+// and dump-md reads it fine. Keying on presence alone would report that
+// blank device as live metadata, skip create-md, and leave adjust to
+// attach a device with no metadata on it.
 func (d *Driver) probeMetadata(ctx context.Context, name string) (hasMD, attached bool, dump string, err error) {
-	if out, err := d.Exec(ctx, "drbdsetup", "status", name); err == nil && strings.Contains(out, name) {
-		return true, true, "", nil
+	if parsed, err := d.listStatus(ctx, name); err == nil {
+		for _, res := range parsed {
+			if res.Name == name && len(res.Devices) > 0 &&
+				res.Devices[0].DiskState != DiskDiskless {
+				return true, true, "", nil
+			}
+		}
 	}
 	out, err := d.adm(ctx, "dump-md", name+"/0")
 	if err != nil && strings.Contains(err.Error(), "unclean") {
