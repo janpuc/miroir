@@ -36,6 +36,14 @@ import (
 const (
 	assertionWatchInterval = time.Second
 	defaultKmsgPath        = "/dev/kmsg"
+	// assertionLogInterval floors the sighted-assertion log line. The
+	// storm repeats one line — ~6/s in the incident behind issue #414,
+	// 482,946 in a day — and at that rate it is the only thing left in
+	// the agent's logs. Wedge.Latch already keeps only the first reason
+	// for the same reason; the counter stays unthrottled, since that is
+	// the honest signal, and each throttled line carries the number of
+	// sightings it stands for.
+	assertionLogInterval = 5 * time.Minute
 )
 
 var metricDRBDAssertions = prometheus.NewCounter(prometheus.CounterOpts{
@@ -85,6 +93,10 @@ type AssertionWatcher struct {
 	Wedge    *backend.Wedge
 	Interval time.Duration
 	metric   prometheus.Counter
+	// lastLog and sightings throttle the log line; drain is the only
+	// writer and runs on Start's single goroutine.
+	lastLog   time.Time
+	sightings int
 }
 
 // Start drains the kmsg ring on entry so an assertion from before the
@@ -168,10 +180,24 @@ func (w *AssertionWatcher) drain(log logr.Logger, f *os.File, partial string, re
 		if w.Wedge != nil {
 			w.Wedge.Latch("kernel log assertion: " + kmsgPayload(line))
 		}
-		log.Info("DRBD kernel assertion sighted; node command breaker latched until reboot",
-			"record", kmsgPayload(line))
+		w.logSighting(log, kmsgPayload(line))
 	}
 	return partial
+}
+
+// logSighting reports a sighted assertion, at most one line per
+// assertionLogInterval, carrying how many sightings it stands for. The
+// first one always logs: the latch it announces is the reason the node
+// stops serving storage, and it must not wait out a throttle.
+func (w *AssertionWatcher) logSighting(log logr.Logger, record string) {
+	w.sightings++
+	if !w.lastLog.IsZero() && time.Since(w.lastLog) < assertionLogInterval {
+		return
+	}
+	log.Info("DRBD kernel assertion sighted; node command breaker latched until reboot",
+		"record", record, "sightings", w.sightings)
+	w.lastLog = time.Now()
+	w.sightings = 0
 }
 
 func kmsgPayload(line string) string {

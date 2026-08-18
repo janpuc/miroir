@@ -109,7 +109,8 @@ tests:
           path: rules
           content:
             apiGroups: ["miroir.home-operations.com"]
-            resources: ["miroirvolumes/status", "miroirsnapshots/status", "miroirsnapshotgroups/status"]
+            resources:
+              ["miroirvolumes/status", "miroirsnapshots/status", "miroirsnapshotgroups/status"]
             verbs: ["get", "update", "patch"]
       # controller-runtime's recorder writes events.k8s.io/v1, not core v1.
       - contains:
@@ -135,16 +136,18 @@ tests:
           path: rules
           content:
             apiGroups: ["miroir.home-operations.com"]
-            resources: ["miroirvolumes/status", "miroirsnapshots/status", "miroirsnapshotgroups/status"]
+            resources:
+              ["miroirvolumes/status", "miroirsnapshots/status", "miroirsnapshotgroups/status"]
             verbs: ["get", "patch"]
-      # reads its own Node's cordon state to gate DRBD shutdown teardown
+      # reads its own Node's cordon state to gate DRBD shutdown teardown,
+      # and patches it to taint a node whose storage stack has wedged
       - contains:
           any: true
           path: rules
           content:
             apiGroups: [""]
             resources: ["nodes"]
-            verbs: ["get", "list", "watch"]
+            verbs: ["get", "list", "watch", "patch"]
       - contains:
           any: true
           path: rules
@@ -152,6 +155,20 @@ tests:
             apiGroups: ["events.k8s.io"]
             resources: ["events"]
             verbs: ["create", "patch"]
+
+  - it: agent loses Node patch when it is not allowed to taint wedged nodes
+    documentIndex: 4
+    set:
+      agent:
+        wedgeTaint: false
+    asserts:
+      - contains:
+          any: true
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["nodes"]
+            verbs: ["get", "list", "watch"]
 
   - it: grants Lease access only when leader election is on
     documentIndex: 2

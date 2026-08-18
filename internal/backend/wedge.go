@@ -124,6 +124,20 @@ func (w *Wedge) Latch(reason string) {
 	}
 }
 
+// Latched reports whether a pinned-open reason holds the breaker, as
+// opposed to a stranded-child count that can still drain. The two need
+// separating wherever the answer drives a decision that outlives the
+// process: a latch survives an agent restart (the kmsg replay re-latches
+// it) and only a reboot clears it.
+func (w *Wedge) Latched() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.latched != ""
+}
+
 func (w *Wedge) alive(pid int) bool {
 	if w.isStranded != nil {
 		return w.isStranded(pid)
@@ -204,13 +218,7 @@ func (w *Wedge) Tripped() bool {
 	if w == nil {
 		return false
 	}
-	w.mu.Lock()
-	latched := w.latched
-	w.mu.Unlock()
-	if latched != "" {
-		return true
-	}
-	return w.StrandedTripped()
+	return w.Latched() || w.StrandedTripped()
 }
 
 // Commands lists the stuck commands, for the Event and status message that

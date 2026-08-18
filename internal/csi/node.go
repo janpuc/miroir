@@ -68,11 +68,13 @@ type Node struct {
 	// staging mount before unstage tears it down (issue #311); nil skips
 	// (tests).
 	Freezer Thawer
-	// Wedge is the node-scoped breaker the unstage unmount consults. Checked
-	// explicitly because mount-utils shells out to umount itself, bypassing
-	// backend.Runner: the staging unmount is of the jammed local device, it
-	// strands there, and kubelet retries NodeUnstageVolume forever. nil
-	// disables the gate.
+	// Wedge is the node-scoped breaker the staging paths consult. Checked
+	// explicitly because mount-utils shells out to mkfs and umount itself,
+	// bypassing backend.Runner: those run against the jammed local device,
+	// strand there, and kubelet retries the RPC forever. Stage refuses
+	// outright while the breaker is open; unstage only refuses the narrower
+	// stranded-children case, so a latched node can still drain. nil
+	// disables both gates.
 	Wedge WedgeGate
 }
 
@@ -86,6 +88,9 @@ type Thawer interface {
 // enough that spawning another host command only makes it worse;
 // *backend.Wedge implements it.
 type WedgeGate interface {
+	// Err names the jam, or is nil when the breaker is closed. Staging
+	// gates on this: both a latched kernel fault and a pile of stranded
+	// children make a fresh mkfs or mount another stuck task.
 	Err() error
 	// StrandedTripped reports whether the jam is one a staging unmount
 	// would join — stranded children stuck in D-state — as opposed to a
@@ -345,6 +350,23 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	}
 	if vol.Spec.Export != nil {
 		return n.stageNFS(req, vol)
+	}
+
+	// Everything below drives this node's local storage stack, and the
+	// breaker is open precisely because that stack no longer makes
+	// progress. Kubelet retries a failed stage forever, so without this the
+	// pod hangs in ContainerCreating while each attempt re-enters the jammed
+	// path and strands another task. Unavailable rather than a terminal
+	// code: staging succeeds again the moment the node comes back.
+	//
+	// Placed after the export branch, not at the top: an RWX volume is
+	// mounted over NFS from a gateway on another node and never touches
+	// the wedged path, so refusing it would widen the outage for no gain.
+	if n.Wedge != nil {
+		if err := n.Wedge.Err(); err != nil {
+			return nil, status.Errorf(codes.Unavailable,
+				"cannot stage %s on node %s: %v", req.GetVolumeId(), n.NodeName, err)
+		}
 	}
 
 	dev, vol, err := n.devicePath(ctx, req.GetVolumeId())

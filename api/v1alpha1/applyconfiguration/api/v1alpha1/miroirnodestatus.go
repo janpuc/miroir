@@ -45,7 +45,8 @@ type MiroirNodeStatusApplyConfiguration struct {
 	// ignores stats older than a few poll intervals as unknown.
 	ObservedAt *v1.Time `json:"observedAt,omitempty"`
 	// Conditions follow the standard Kubernetes condition conventions;
-	// PoolUsageHigh fires at the 80% data/metadata warn line (any pool).
+	// PoolUsageHigh fires at the 80% data/metadata warn line (any pool)
+	// and StorageWedged while the node-scoped command breaker is open.
 	Conditions []metav1.ConditionApplyConfiguration `json:"conditions,omitempty"`
 }
 

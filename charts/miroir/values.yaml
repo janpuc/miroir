@@ -86,6 +86,21 @@ autoDiskfulAfter: ""
 # the volume's pool; per-node opt-out via `spec.autoEvict: false` on its MiroirNode.
 # Empty disables it (the default: eviction discards the dead node's data).
 autoEvictAfter: ""
+# -- Condition a MiroirVolume `Orphaned` once it has existed this long with
+# no PersistentVolume of its name (Go duration). An orphan still holds
+# thin-pool space, a DRBD minor, a replication port and a full set of
+# `miroir_volume_*` series — including the per-volume wedge gauge, which then
+# alerts on a volume nobody owns. The grace period covers the provisioning
+# race: CreateVolume creates the MiroirVolume and the external provisioner
+# creates the PV afterwards. Empty disables the sweep.
+orphanVolumeAfter: 1h
+# -- Delete a volume once `Orphaned` has held this long (Go duration). Never
+# while a client leg is attached, a leg is DRBD Primary, or a snapshot still
+# references it. Empty (the default) leaves the condition standing for an
+# operator: a wrong condition costs a line in `kubectl describe`, a wrong
+# delete costs a backing device. Set it once the condition has been seen to
+# name only volumes you would have deleted by hand anyway.
+orphanVolumeReapAfter: ""
 # Storage-capacity-aware scheduling. When enabled, the external-provisioner
 # publishes CSIStorageCapacity objects from the driver's GetCapacity RPC
 # (capacity × overcommitRatio − provisioned, per storage node) and the
@@ -229,6 +244,22 @@ agent:
   # serialized by controller-runtime regardless; this bounds how many
   # distinct volumes one agent works at once.
   volumeWorkers: 4
+  # -- Let a healthy node drop the replication link to a peer whose storage
+  # stack has wedged, by leaving it out of the rendered DRBD config. A wedged
+  # node's kernel holds every resource it had open read-only, and DRBD then
+  # refuses promotion on the healthy peers, so clean survivors cannot serve a
+  # volume the dead node is sitting on. Off by default: it changes DRBD
+  # membership from live peer state, and that wants validating against a real
+  # wedged node before it runs unattended. `autoEvict` reaches the same outcome
+  # through the spec, with all the placement gates, a few minutes later.
+  peerFence: false
+  # -- Taint a node `miroir.home-operations.com/storage-wedged=true:NoSchedule`
+  # while its storage stack is wedged. A wedged node keeps a Ready kubelet, so
+  # without this the scheduler keeps sending it pods it cannot mount. The agent
+  # removes the taint once a reboot clears the kernel state. Turn off when
+  # another controller owns node remediation and miroir should not write to
+  # Node objects; doing so also drops `patch` on `nodes` from the agent's RBAC.
+  wedgeTaint: true
   # @schema
   # type: array
   # items:

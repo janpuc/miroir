@@ -55,6 +55,8 @@ spec:
             - --metrics-bind-address=:9810
             - --pool-stats-interval={{ .Values.agent.poolStatsInterval }}
             - --volume-workers={{ .Values.agent.volumeWorkers }}
+            - --wedge-taint={{ .Values.agent.wedgeTaint }}
+            - --peer-fence={{ .Values.agent.peerFence }}
             {{- if and .Values.drbd.verify.schedule (not .Values.drbd.verify.suspend) }}
             - --verify-schedule={{ .Values.drbd.verify.schedule }}
             {{- end }}

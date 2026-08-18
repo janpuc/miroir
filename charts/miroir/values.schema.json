@@ -65,6 +65,12 @@
           "title": "loopfileBaseDirs",
           "type": "array"
         },
+        "peerFence": {
+          "default": false,
+          "description": "Let a healthy node drop the replication link to a peer whose storage\nstack has wedged, by leaving it out of the rendered DRBD config. A wedged\nnode's kernel holds every resource it had open read-only, and DRBD then\nrefuses promotion on the healthy peers, so clean survivors cannot serve a\nvolume the dead node is sitting on. Off by default: it changes DRBD\nmembership from live peer state, and that wants validating against a real\nwedged node before it runs unattended. `autoEvict` reaches the same outcome\nthrough the spec, with all the placement gates, a few minutes later.",
+          "title": "peerFence",
+          "type": "boolean"
+        },
         "podAnnotations": {
           "description": "Extra annotations on the agent pods.",
           "required": [],
@@ -174,6 +180,12 @@
           "description": "Concurrent volume reconciles per agent. Per-volume work is\nserialized by controller-runtime regardless; this bounds how many\ndistinct volumes one agent works at once.",
           "title": "volumeWorkers",
           "type": "integer"
+        },
+        "wedgeTaint": {
+          "default": true,
+          "description": "Taint a node `miroir.home-operations.com/storage-wedged=true:NoSchedule`\nwhile its storage stack is wedged. A wedged node keeps a Ready kubelet, so\nwithout this the scheduler keeps sending it pods it cannot mount. The agent\nremoves the taint once a reboot clears the kernel state. Turn off when\nanother controller owns node remediation and miroir should not write to\nNode objects; doing so also drops `patch` on `nodes` from the agent's RBAC.",
+          "title": "wedgeTaint",
+          "type": "boolean"
         }
       },
       "required": [],
@@ -749,6 +761,18 @@
       "default": "",
       "description": "Override the chart name used in labels and default object names.",
       "title": "nameOverride",
+      "type": "string"
+    },
+    "orphanVolumeAfter": {
+      "default": "1h",
+      "description": "Condition a MiroirVolume `Orphaned` once it has existed this long with\nno PersistentVolume of its name (Go duration). An orphan still holds\nthin-pool space, a DRBD minor, a replication port and a full set of\n`miroir_volume_*` series — including the per-volume wedge gauge, which then\nalerts on a volume nobody owns. The grace period covers the provisioning\nrace: CreateVolume creates the MiroirVolume and the external provisioner\ncreates the PV afterwards. Empty disables the sweep.",
+      "title": "orphanVolumeAfter",
+      "type": "string"
+    },
+    "orphanVolumeReapAfter": {
+      "default": "",
+      "description": "Delete a volume once `Orphaned` has held this long (Go duration). Never\nwhile a client leg is attached, a leg is DRBD Primary, or a snapshot still\nreferences it. Empty (the default) leaves the condition standing for an\noperator: a wrong condition costs a line in `kubectl describe`, a wrong\ndelete costs a backing device. Set it once the condition has been seen to\nname only volumes you would have deleted by hand anyway.",
+      "title": "orphanVolumeReapAfter",
       "type": "string"
     },
     "overcommitRatio": {

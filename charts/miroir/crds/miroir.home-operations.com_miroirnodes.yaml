@@ -221,7 +221,8 @@ spec:
               conditions:
                 description: |-
                   Conditions follow the standard Kubernetes condition conventions;
-                  PoolUsageHigh fires at the 80% data/metadata warn line (any pool).
+                  PoolUsageHigh fires at the 80% data/metadata warn line (any pool)
+                  and StorageWedged while the node-scoped command breaker is open.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

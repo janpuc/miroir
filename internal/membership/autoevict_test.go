@@ -437,6 +437,125 @@ func TestAutoEvictProceedsWhenNodeNotReady(t *testing.T) {
 	}
 }
 
+// wedgedFor stamps the StorageWedged condition the node's own agent
+// publishes, transitioned `since` ago.
+func wedgedFor(mn *miroirv1alpha1.MiroirNode, since time.Duration) *miroirv1alpha1.MiroirNode {
+	mn.Status.Conditions = append(mn.Status.Conditions, metav1.Condition{
+		Type:               miroirv1alpha1.ConditionStorageWedged,
+		Status:             metav1.ConditionTrue,
+		Reason:             miroirv1alpha1.ReasonKernelAssertion,
+		Message:            "node storage stack wedged: node reboot required",
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-since)),
+	})
+	return mn
+}
+
+// readyKubelet is the Node object of the node under test, reporting the
+// Ready condition a wedged node keeps for the whole outage.
+func readyKubelet() *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeB},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+		}},
+	}
+}
+
+// The incident this exists for: a node whose storage stack wedged keeps
+// heartbeating, keeps a Ready kubelet, and keeps its DRBD links up, so
+// every liveness gate reads healthy while it serves nothing. All three
+// have to be overridden or the eviction never fires.
+func TestAutoEvictEvictsWedgedReadyNode(t *testing.T) {
+	v := evictVol()
+	// A wedged peer's links stay established — that is why its survivors
+	// could not promote in the first place.
+	v.Status.PerNode = map[string]miroirv1alpha1.ReplicaStatus{
+		nodeA: {DiskState: drbd.DiskUpToDate, Connected: true},
+	}
+	r := newAE(t, v, readyKubelet(),
+		minAt(nodeA, time.Minute, 50<<30),
+		wedgedFor(minAt(nodeB, time.Minute, 50<<30), time.Hour),
+		minAt(nodeD, time.Minute, 50<<30))
+
+	reconcileAE(t, r, nodeB)
+
+	got := get(t, &Reconciler{Client: r.Client}, volPvc1)
+	if slices.ContainsFunc(got.Spec.Replicas, func(rep miroirv1alpha1.Replica) bool {
+		return rep.Node == nodeB
+	}) {
+		t.Fatalf("a wedged node's leg must be re-placed however alive it looks: %+v", got.Spec.Replicas)
+	}
+	if !slices.ContainsFunc(got.Spec.Replicas, func(rep miroirv1alpha1.Replica) bool {
+		return rep.Node == nodeD
+	}) {
+		t.Fatalf("replacement must land on the spare node: %+v", got.Spec.Replicas)
+	}
+}
+
+// A reboot clears the kernel state and needs no eviction at all, so a
+// fresh latch gets a head start before its legs are moved.
+func TestAutoEvictWaitsForWedgeToSettle(t *testing.T) {
+	r := newAE(t, evictVol(), readyKubelet(),
+		minAt(nodeA, time.Minute, 50<<30),
+		wedgedFor(minAt(nodeB, time.Minute, 50<<30), time.Minute),
+		minAt(nodeD, time.Minute, 50<<30))
+
+	res := reconcileAE(t, r, nodeB)
+
+	got := get(t, &Reconciler{Client: r.Client}, volPvc1)
+	if len(got.Spec.Replicas) != 2 {
+		t.Fatalf("a freshly wedged node must be left alone: %+v", got.Spec)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > wedgeSettleFor {
+		t.Fatalf("must requeue for the rest of the settle period, got %v", res.RequeueAfter)
+	}
+	if v := testutil.ToFloat64(metricEvictStanddown.WithLabelValues("wedge_settling")); v < 1 {
+		t.Fatalf("stand-down counter must increment, got %v", v)
+	}
+}
+
+// The wedge only adds a reason to call the node dead; it must not buy a
+// pass on the gates that decide whether the volume survives losing the leg.
+func TestAutoEvictWedgedStillNeedsCleanSurvivor(t *testing.T) {
+	v := evictVol()
+	v.Status.PerNode = map[string]miroirv1alpha1.ReplicaStatus{
+		nodeA: {DiskState: "Inconsistent"},
+	}
+	r := newAE(t, v, readyKubelet(),
+		minAt(nodeA, time.Minute, 50<<30),
+		wedgedFor(minAt(nodeB, time.Minute, 50<<30), time.Hour),
+		minAt(nodeD, time.Minute, 50<<30))
+
+	res := reconcileAE(t, r, nodeB)
+
+	got := get(t, &Reconciler{Client: r.Client}, volPvc1)
+	if !slices.ContainsFunc(got.Spec.Replicas, func(rep miroirv1alpha1.Replica) bool {
+		return rep.Node == nodeB
+	}) {
+		t.Fatalf("evicting onto a survivor that is not UpToDate would cost data: %+v", got.Spec.Replicas)
+	}
+	if res.RequeueAfter != evictRecheckInterval {
+		t.Fatalf("a blocked volume must re-check later, got %v", res.RequeueAfter)
+	}
+}
+
+// Two nodes wedging at once is the same shape of claim as two silent
+// heartbeats — likelier a shared cause than two independent deaths — and
+// the census counts both routes so the valve still catches it.
+func TestAutoEvictValveMultipleWedged(t *testing.T) {
+	r := newAE(t, evictVol(), readyKubelet(),
+		wedgedFor(minAt(nodeA, time.Minute, 50<<30), time.Hour),
+		wedgedFor(minAt(nodeB, time.Minute, 50<<30), time.Hour),
+		minAt(nodeD, time.Minute, 50<<30))
+
+	reconcileAE(t, r, nodeB)
+
+	got := get(t, &Reconciler{Client: r.Client}, volPvc1)
+	if len(got.Spec.Replicas) != 2 {
+		t.Fatalf("valve must block all evictions: %+v", got.Spec)
+	}
+}
+
 // One membership edit at a time: an entry still awaiting completion
 // blocks the swap — acting on a half-completed spec races the membership
 // reconciler's update.

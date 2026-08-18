@@ -76,6 +76,10 @@ spec:
             {{- with .Values.autoEvictAfter }}
             - --auto-evict-after={{ . }}
             {{- end }}
+            - --orphan-volume-after={{ .Values.orphanVolumeAfter | default "0" }}
+            {{- with .Values.orphanVolumeReapAfter }}
+            - --orphan-volume-reap-after={{ . }}
+            {{- end }}
             - --drbd-port-base={{ .Values.drbd.portBase }}
             {{- if .Values.gateway.enabled }}
             - --gateway-image={{ include "miroir.gatewayImage" . }}

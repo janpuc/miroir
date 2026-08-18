@@ -48,6 +48,15 @@ const (
 // gate staging.
 const ConditionNodeUnreachable = "NodeUnreachable"
 
+// ConditionOrphaned indicates that no PersistentVolume shares this
+// volume's name, so nothing in the cluster references the storage it
+// still holds — thin-pool space, a DRBD minor, a replication port, and a
+// full set of miroir_volume_* series. Raised by the orphan sweep once the
+// provisioning grace period has passed; cleared if a PV appears. Whether
+// it is then collected is opt-in (--orphan-volume-reap-after); on its own
+// the condition only makes the leak visible.
+const ConditionOrphaned = "Orphaned"
+
 // Replica is one placement of the volume's data — a DRBD peer when the
 // volume is replicated.
 type Replica struct {

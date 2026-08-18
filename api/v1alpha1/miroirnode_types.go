@@ -118,6 +118,36 @@ type MiroirNodeSpec struct {
 	Pools []MiroirNodePool `json:"pools"`
 }
 
+// Condition types reported on a MiroirNode by its own agent. The
+// controller-side topology conditions live with the reconciler that
+// raises them; these two are published from the node.
+const (
+	// ConditionStorageWedged is True while this node's storage stack has
+	// jammed badly enough that its agent refuses to spawn further storage
+	// commands. It is the machine-readable form of the node-scoped
+	// breaker behind miroir_node_wedged: a DRBD kernel assertion latched
+	// it (ReasonKernelAssertion, reboot-only) or enough host commands
+	// stranded in uninterruptible sleep to trip it
+	// (ReasonStrandedChildren, self-healing as they drain).
+	//
+	// A wedged node's kubelet stays Ready and its DRBD links stay
+	// established, so this is the only signal that separates "alive" from
+	// "alive but unable to serve storage"; auto-evict reads it to treat
+	// the node as dead.
+	ConditionStorageWedged = "StorageWedged"
+	// ReasonKernelAssertion marks a breaker latched by a fatal DRBD
+	// kernel assertion (LINBIT/drbd#137): the refcount damage behind it
+	// persists across an agent restart, so only a node reboot clears it.
+	ReasonKernelAssertion = "KernelAssertion"
+	// ReasonStrandedChildren marks a breaker tripped by the count of
+	// host commands stuck in uninterruptible sleep, which retires itself
+	// as those tasks drain.
+	ReasonStrandedChildren = "StrandedChildren"
+	// ReasonStorageHealthy is the condition reason while the breaker is
+	// closed.
+	ReasonStorageHealthy = "StorageHealthy"
+)
+
 // MiroirNodePoolStatus is one pool's capacity figures.
 // On a shared pool (e.g. ZFS shared with OpenEBS) the figures are
 // pool-level, so a co-tenant's growth correctly shrinks miroir's headroom.
@@ -167,9 +197,29 @@ type MiroirNodeStatus struct {
 	// +optional
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
 	// Conditions follow the standard Kubernetes condition conventions;
-	// PoolUsageHigh fires at the 80% data/metadata warn line (any pool).
+	// PoolUsageHigh fires at the 80% data/metadata warn line (any pool)
+	// and StorageWedged while the node-scoped command breaker is open.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// StorageWedgedSince reports whether the node's agent has raised
+// StorageWedged, and when it first went True. The transition time is the
+// clock every consumer's settle period runs on, and it survives an agent
+// restart on an unrebooted node: the kmsg replay re-latches the breaker
+// before the condition is republished, so True never flips to False and
+// back.
+func (s MiroirNodeStatus) StorageWedgedSince() (bool, metav1.Time) {
+	for i := range s.Conditions {
+		if s.Conditions[i].Type != ConditionStorageWedged {
+			continue
+		}
+		if s.Conditions[i].Status != metav1.ConditionTrue {
+			return false, metav1.Time{}
+		}
+		return true, s.Conditions[i].LastTransitionTime
+	}
+	return false, metav1.Time{}
 }
 
 // Pool returns the named pool's capacity entry, or nil. Empty means the

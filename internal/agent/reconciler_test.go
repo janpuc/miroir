@@ -3866,7 +3866,7 @@ func TestFastPathMissesOnPeerDiskStateChange(t *testing.T) {
 func TestDrbdResourceBitmapGranularity(t *testing.T) {
 	v := vol(volPvc1, nodeA, nodeB)
 	v.Spec.DRBD = &miroirv1alpha1.DRBDSpec{Port: 7000, BitmapGranularityBytes: 65536}
-	r := drbdResource(v, nodeA, "/dev/vg/pvc-1", 1000, false, 0)
+	r := drbdResource(v, nodeA, "/dev/vg/pvc-1", 1000, false, 0, nil)
 	if r.BitmapGranularityBytes != 65536 {
 		t.Fatalf("granularity = %d, want 65536", r.BitmapGranularityBytes)
 	}
@@ -3884,10 +3884,10 @@ func TestDrbdResourceClientDiscardGranularity(t *testing.T) {
 		nodeB: {DiscardGranularityBytes: 16384},  // zvol block
 	}
 
-	if r := drbdResource(v, nodeC, "", 1000, true, 0); r.ClientDiscardGranularityBytes != 262144 {
+	if r := drbdResource(v, nodeC, "", 1000, true, 0, nil); r.ClientDiscardGranularityBytes != 262144 {
 		t.Fatalf("client granularity = %d, want max(peers) 262144", r.ClientDiscardGranularityBytes)
 	}
-	if r := drbdResource(v, nodeA, "/dev/vg/pvc-1", 1000, false, 262144); r.ClientDiscardGranularityBytes != 0 {
+	if r := drbdResource(v, nodeA, "/dev/vg/pvc-1", 1000, false, 262144, nil); r.ClientDiscardGranularityBytes != 0 {
 		t.Fatalf("a replica must not advertise a client granularity, got %d", r.ClientDiscardGranularityBytes)
 	}
 }

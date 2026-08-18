@@ -24,6 +24,14 @@ import "time"
 // down and its stats can't be trusted for placement or auto-diskful.
 const StatsStaleAfter = 5 * time.Minute
 
+// WedgeSettleAfter is how long a node's StorageWedged condition must hold
+// before anything acts on it — auto-evict re-placing its legs, or a
+// surviving peer dropping its replication link. It is really a head start
+// for the cheaper fix: a reboot clears the kernel state, drops the
+// condition, and needs neither. Comfortably past a node reboot, and
+// nowhere near the hours an unattended wedge otherwise costs.
+const WedgeSettleAfter = 10 * time.Minute
+
 const (
 	// DriverName is the CSI driver name, also the CRD API group.
 	DriverName = "miroir.home-operations.com"
@@ -31,6 +39,15 @@ const (
 	// TopologyKey is the CSI topology key reported by NodeGetInfo; its
 	// value is the Kubernetes node name.
 	TopologyKey = "miroir.home-operations.com/node"
+
+	// TaintStorageWedged is set on a node whose storage stack has jammed
+	// (see v1alpha1.ConditionStorageWedged), with effect NoSchedule so the
+	// scheduler stops placing new consumers there. Deliberately not
+	// NoExecute: pods already there cannot start anywhere else until
+	// auto-evict re-places their legs, so evicting them helps nobody.
+	// The node's own agent owns the taint and only removes it after a
+	// reboot clears the kernel state.
+	TaintStorageWedged = "miroir.home-operations.com/storage-wedged"
 
 	// FinalizerPrefix + node name blocks MiroirVolume deletion until that
 	// node's agent has torn down its local state. One finalizer per

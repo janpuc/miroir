@@ -18,12 +18,15 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -112,5 +115,36 @@ func TestAssertionWatcherTripsTheWedge(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Start() = %v, want nil on shutdown", err)
+	}
+}
+
+// The storm repeats one line thousands of times a minute. The first
+// sighting must land immediately — it announces the latch — and the rest
+// must collapse into a periodic line carrying the count.
+func TestAssertionWatcherThrottlesTheLogLine(t *testing.T) {
+	var lines []int
+	sink := funcr.New(func(_, args string) {
+		if n := strings.Index(args, `"sightings"=`); n >= 0 {
+			var count int
+			if _, err := fmt.Sscanf(args[n:], `"sightings"=%d`, &count); err == nil {
+				lines = append(lines, count)
+			}
+		}
+	}, funcr.Options{})
+	w := &AssertionWatcher{}
+
+	w.logSighting(sink, "first")
+	for range 999 {
+		w.logSighting(sink, "storm")
+	}
+	if !slices.Equal(lines, []int{1}) {
+		t.Fatalf("1000 sightings must log once, got %v", lines)
+	}
+
+	// Past the floor, one line stands for everything suppressed since.
+	w.lastLog = time.Now().Add(-assertionLogInterval - time.Second)
+	w.logSighting(sink, "storm")
+	if !slices.Equal(lines, []int{1, 1000}) {
+		t.Fatalf("the throttled line must carry the suppressed count, got %v", lines)
 	}
 }

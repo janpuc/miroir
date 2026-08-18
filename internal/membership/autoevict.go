@@ -40,6 +40,12 @@ import (
 // been stale for After, each volume with a leg there gets one atomic
 // spec update — dead entry out, replacement in.
 //
+// A node whose storage stack has wedged counts as dead too, on the
+// StorageWedged condition its own agent publishes, and it has to: it
+// keeps heartbeating, its kubelet stays Ready and its DRBD links stay
+// established, so every liveness signal here reads healthy on a node
+// that cannot serve a single volume. Nothing else would ever fire.
+//
 // The dead node's teardown finalizer is deliberately left in place: it
 // is the durable record that the leg was never torn down there. When
 // the node returns, its agent runs the ordinary removal flow
@@ -70,6 +76,12 @@ type AutoEvictReconciler struct {
 // blockers live in volume status, snapshots, or other nodes' heartbeats.
 const evictRecheckInterval = 5 * time.Minute
 
+// wedgeSettleFor is how long StorageWedged must hold before the node
+// counts as dead — deliberately not After: heartbeat staleness and a
+// latched breaker are different signals, and every consumer of the
+// latch waits out the same shared period.
+const wedgeSettleFor = constants.WedgeSettleAfter
+
 // evictPass is the cluster state gathered once per reconcile pass and
 // shared by every per-volume decision — listing snapshots or re-reading
 // node stats per volume would multiply two collection sizes for answers
@@ -83,8 +95,9 @@ type evictPass struct {
 	topology nodemap.Map
 }
 
-// Reconcile checks one node's heartbeat and, once it has been stale for
-// After, evicts that node's legs volume by volume.
+// Reconcile decides whether one node is dead — its heartbeat stale for
+// After, or its storage breaker latched past the settle period — and if
+// so evicts that node's legs volume by volume.
 func (r *AutoEvictReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -104,37 +117,54 @@ func (r *AutoEvictReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return n.Name == req.Name
 	})
 	mn := &nodes.Items[idx]
-	if mn.Status.ObservedAt == nil {
-		// Never heartbeated: there is no "was alive, went dark" signal to
-		// act on (a node added to the map but not yet provisioned).
-		return ctrl.Result{}, nil
-	}
-	if remaining := r.After - time.Since(mn.Status.ObservedAt.Time); remaining > 0 {
-		return ctrl.Result{RequeueAfter: remaining}, nil
-	}
-	if ready, err := r.nodeReady(ctx, req.Name); err != nil {
-		return ctrl.Result{}, err
-	} else if ready {
-		// The kubelet still heartbeats: the node is alive and only the
-		// miroir agent's heartbeat is gone (crash-loop, rollout stuck).
-		// Its DRBD legs replicate in the kernel without the agent, and a
-		// consumer pod there is still doing IO through its client leg —
-		// evicting anything would sever live storage.
-		metricEvictStanddown.WithLabelValues("node_ready").Inc()
-		log.Info("auto-evict standing down: the node's kubelet is Ready", "node", req.Name)
-		return ctrl.Result{RequeueAfter: evictRecheckInterval}, nil
+	switch wedged, since := storageWedged(mn); {
+	case wedged && time.Since(since) < wedgeSettleFor:
+		// Give a reboot the chance to fix this the cheap way, and cover a
+		// latch that a rolling agent restart raised in passing.
+		metricEvictStanddown.WithLabelValues("wedge_settling").Inc()
+		log.Info("auto-evict standing down: the node's storage breaker latched too recently",
+			"node", req.Name, "wedgedFor", time.Since(since).Truncate(time.Second),
+			"settleAfter", wedgeSettleFor)
+		return ctrl.Result{RequeueAfter: wedgeSettleFor - time.Since(since)}, nil
+	case wedged:
+		// Dead where it counts. Skipping the heartbeat and kubelet gates
+		// below is the whole point: a wedged node passes both with full
+		// marks while serving nothing.
+		log.Info("auto-evict proceeding: the node's storage stack is wedged",
+			"node", req.Name, "wedgedSince", since)
+	default:
+		if mn.Status.ObservedAt == nil {
+			// Never heartbeated: there is no "was alive, went dark" signal
+			// to act on (a node added to the map but not yet provisioned).
+			return ctrl.Result{}, nil
+		}
+		if remaining := r.After - time.Since(mn.Status.ObservedAt.Time); remaining > 0 {
+			return ctrl.Result{RequeueAfter: remaining}, nil
+		}
+		if ready, err := r.nodeReady(ctx, req.Name); err != nil {
+			return ctrl.Result{}, err
+		} else if ready {
+			// The kubelet still heartbeats: the node is alive and only the
+			// miroir agent's heartbeat is gone (crash-loop, rollout stuck).
+			// Its DRBD legs replicate in the kernel without the agent, and a
+			// consumer pod there is still doing IO through its client leg —
+			// evicting anything would sever live storage.
+			metricEvictStanddown.WithLabelValues("node_ready").Inc()
+			log.Info("auto-evict standing down: the node's kubelet is Ready", "node", req.Name)
+			return ctrl.Result{RequeueAfter: evictRecheckInterval}, nil
+		}
 	}
 
-	pass, stale, err := r.gather(ctx, nodes, topology)
+	pass, dead, err := r.gather(ctx, nodes, topology)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if len(stale) > 1 {
+	if len(dead) > 1 {
 		// Safety valve: several nodes going dark together points at the
 		// observer side (API server, network, this controller), not at
 		// that many simultaneous hardware deaths. Do nothing.
 		metricEvictStanddown.WithLabelValues("multiple_stale").Inc()
-		log.Info("auto-evict standing down: multiple stale heartbeats", "nodes", stale)
+		log.Info("auto-evict standing down: more than one node looks dead", "nodes", dead)
 		return ctrl.Result{RequeueAfter: evictRecheckInterval}, nil
 	}
 
@@ -175,14 +205,16 @@ func (r *AutoEvictReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 // gather builds the cluster state one eviction pass needs from the
 // caller's MiroirNode list (the safety-valve census and the capacity
-// views) plus one snapshot list (the pin set).
+// views) plus one snapshot list (the pin set). The census counts every
+// node that looks dead by either route, so two nodes wedging together
+// trips the valve exactly as two silent heartbeats would.
 func (r *AutoEvictReconciler) gather(ctx context.Context, nodes *miroirv1alpha1.MiroirNodeList, topology nodemap.Map) (*evictPass, []string, error) {
 	pass := &evictPass{
 		pinned:   map[string]bool{},
 		nodes:    make(map[string]*miroirv1alpha1.MiroirNode, len(nodes.Items)),
 		topology: topology,
 	}
-	var stale []string
+	var dead []string
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
 		pass.nodes[n.Name] = n
@@ -193,11 +225,15 @@ func (r *AutoEvictReconciler) gather(ctx context.Context, nodes *miroirv1alpha1.
 			// nodes that actually died.
 			continue
 		}
+		if wedged, since := storageWedged(n); wedged && time.Since(since) >= wedgeSettleFor {
+			dead = append(dead, n.Name)
+			continue
+		}
 		if n.Status.ObservedAt != nil && time.Since(n.Status.ObservedAt.Time) >= r.After {
-			stale = append(stale, n.Name)
+			dead = append(dead, n.Name)
 		}
 	}
-	slices.Sort(stale)
+	slices.Sort(dead)
 	snaps := &miroirv1alpha1.MiroirSnapshotList{}
 	if err := r.List(ctx, snaps); err != nil {
 		return nil, nil, err
@@ -205,7 +241,20 @@ func (r *AutoEvictReconciler) gather(ctx context.Context, nodes *miroirv1alpha1.
 	for i := range snaps.Items {
 		pass.pinned[snaps.Items[i].Spec.VolumeName] = true
 	}
-	return pass, stale, nil
+	return pass, dead, nil
+}
+
+// storageWedged reports whether the node's own agent has published a
+// StorageWedged condition, and when it first went True — the clock the
+// settle period runs on. It survives an agent restart on an unrebooted
+// node (the kmsg replay re-latches the breaker, so the condition never
+// flips), which is exactly what makes it a usable death certificate.
+func storageWedged(mn *miroirv1alpha1.MiroirNode) (bool, time.Time) {
+	if mn == nil {
+		return false, time.Time{}
+	}
+	wedged, since := mn.Status.StorageWedgedSince()
+	return wedged, since.Time
 }
 
 // nodeReady reports whether the node's kubelet heartbeat is current — a
@@ -296,6 +345,11 @@ func evictBlocked(vol *miroirv1alpha1.MiroirVolume, dead string, deadIdx int, pa
 		return "a membership change is already in flight", blockedOutcome
 	}
 	deadDiskful := deadIdx >= 0 && !vol.Spec.Replicas[deadIdx].Diskless
+	// A wedged node's replication links stay up — the jam is in its local
+	// disk path, not on the wire — so its peers keep reading Connected.
+	// The node's own agent has already said it cannot serve storage, and a
+	// first-person report outranks a peer's inference from a live socket.
+	wedged, _ := storageWedged(pass.nodes[dead])
 	for _, rep := range vol.Spec.Replicas {
 		if rep.Node == dead || rep.Diskless {
 			continue
@@ -308,7 +362,7 @@ func evictBlocked(vol *miroirv1alpha1.MiroirVolume, dead string, deadIdx int, pa
 			// survivor by definition.)
 			return "replica on " + rep.Node + " is not UpToDate", blockedOutcome
 		}
-		if deadDiskful && st.Connected {
+		if deadDiskful && st.Connected && !wedged {
 			// Connected means links to *every* diskful peer, including
 			// the dead one: proof of life.
 			return "survivor " + rep.Node + " still sees the node's DRBD links up", peerConnectedOutcome

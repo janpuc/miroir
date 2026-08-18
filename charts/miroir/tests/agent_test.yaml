@@ -289,6 +289,23 @@ tests:
           path: spec.template.spec.containers[0].args
           content: --verify-schedule=0 5 * * 0
 
+  - it: taints a wedged node by default, and stands off when told to
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --wedge-taint=true
+
+  - it: passes --wedge-taint=false when node remediation is someone else's
+    set:
+      agent:
+        wedgeTaint: false
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --wedge-taint=false
+
   - it: passes --verify-schedule when a schedule is set
     set:
       drbd:

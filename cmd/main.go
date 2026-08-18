@@ -90,10 +90,10 @@ func init() {
 // operator-added replica entries), the tie-breaker retrofit for
 // pre-existing 2-replica freeze volumes (#70) when enabled, the
 // auto-diskful converter for long-lived client legs when a threshold is
-// set, and the auto-evict reconciler for dead nodes when its threshold
-// is set.
+// set, the auto-evict reconciler for dead nodes when its threshold is
+// set, and the orphan sweep for volumes with no backing PV.
 func setupMembership(mgr ctrl.Manager, nodes nodemap.Source, autoTieBreaker bool,
-	autoDiskfulAfter, autoEvictAfter time.Duration,
+	autoDiskfulAfter, autoEvictAfter, orphanAfter, orphanReapAfter time.Duration,
 ) error {
 	r := &membership.Reconciler{Client: mgr.GetClient(), Nodes: nodes, PVs: mgr.GetAPIReader()}
 	if err := r.SetupWithManager(mgr); err != nil {
@@ -118,6 +118,18 @@ func setupMembership(mgr ctrl.Manager, nodes nodemap.Source, autoTieBreaker bool
 		}
 		if err := ae.SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("auto-evict reconciler: %w", err)
+		}
+	}
+	if orphanAfter > 0 {
+		or := &membership.OrphanReconciler{
+			Client:    mgr.GetClient(),
+			PVs:       mgr.GetAPIReader(),
+			After:     orphanAfter,
+			ReapAfter: orphanReapAfter,
+			Recorder:  mgr.GetEventRecorder("miroir-controller"),
+		}
+		if err := or.SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("orphan volume reconciler: %w", err)
 		}
 	}
 	if !autoTieBreaker {
@@ -412,6 +424,8 @@ func main() {
 		autoTieBreaker   bool
 		autoDiskfulAfter time.Duration
 		autoEvictAfter   time.Duration
+		orphanAfter      time.Duration
+		orphanReapAfter  time.Duration
 		drbdPortBase     int
 		leaderElect      bool
 		leaderElectionID string
@@ -426,6 +440,8 @@ func main() {
 		poolStatsInterval time.Duration
 		volumeWorkers     int
 		verifySchedule    string
+		wedgeTaint        bool
+		peerFence         bool
 
 		// gateway mode
 		volumeName  string
@@ -449,6 +465,13 @@ func main() {
 	flag.DurationVar(&autoEvictAfter, "auto-evict-after", 0,
 		"re-place a dead storage node's replicas once its MiroirNode heartbeat has been stale this long "+
 			"(controller; 0 disables; needs a spare storage node — see LINSTOR auto-evict)")
+	flag.DurationVar(&orphanAfter, "orphan-volume-after", time.Hour,
+		"condition a MiroirVolume Orphaned once it has existed this long with no PersistentVolume "+
+			"of its name — it still holds pool space, a DRBD minor and a port (controller; 0 disables)")
+	flag.DurationVar(&orphanReapAfter, "orphan-volume-reap-after", 0,
+		"delete an Orphaned volume once the condition has held this long (controller; 0 disables, "+
+			"leaving the condition to an operator — a wrong condition costs a log line, a wrong "+
+			"delete costs a backing device)")
 	flag.BoolVar(&autoTieBreaker, "auto-tie-breaker", true,
 		"add a diskless tie-breaker to 2-replica freeze volumes when a spare node exists (controller)")
 	flag.IntVar(&drbdPortBase, "drbd-port-base", 7000,
@@ -475,6 +498,14 @@ func main() {
 			"node coordinates (agent; empty disables; requires verify-alg in the DRBD common config)")
 	flag.StringVar(&drbdStateDir, "drbd-state-dir", "/etc/drbd.d",
 		"rendered DRBD config dir (agent; hostPath-backed)")
+	flag.BoolVar(&peerFence, "peer-fence", false,
+		"leave a wedged peer out of this node's rendered DRBD config so its kernel stops vetoing "+
+			"promotion here (agent; off by default — it changes DRBD membership from live peer "+
+			"state and wants validating against a real wedged node first)")
+	flag.BoolVar(&wedgeTaint, "wedge-taint", true,
+		"taint this node "+constants.TaintStorageWedged+"=true:NoSchedule while its storage stack is "+
+			"wedged, so the scheduler stops placing consumers on a node that cannot mount them "+
+			"(agent; disable when another controller owns node remediation)")
 	flag.StringVar(&volumeName, "volume", "", "MiroirVolume to export over NFS (gateway)")
 	flag.StringVar(&exportDir, "export-dir", "/export",
 		"parent directory for the per-volume mount point (gateway)")
@@ -582,7 +613,8 @@ func main() {
 			Recorder:         mgr.GetEventRecorder("miroir-controller"),
 		}
 		setupPhaseReconciler(mgr)
-		if err := setupMembership(mgr, nodes, autoTieBreaker, autoDiskfulAfter, autoEvictAfter); err != nil {
+		if err := setupMembership(mgr, nodes, autoTieBreaker, autoDiskfulAfter, autoEvictAfter,
+			orphanAfter, orphanReapAfter); err != nil {
 			setupLog.Error(err, "unable to set up membership reconcilers")
 			os.Exit(1)
 		}
@@ -712,6 +744,7 @@ func main() {
 			addRunnable(watcher, "unable to add DRBD event watcher")
 			addRunnable(&agent.AssertionWatcher{Wedge: storageWedge}, "unable to add DRBD assertion watcher")
 		}
+		wedgedPeers := addWedgedPeerWatch(mgr, nodeName, peerFence, drbdReady)
 		reconciler := &agent.VolumeReconciler{
 			Client:     mgr.GetClient(),
 			NodeName:   nodeName,
@@ -720,6 +753,7 @@ func main() {
 			DRBDEvents: drbdEvents,
 			Workers:    volumeWorkers,
 			Recorder:   mgr.GetEventRecorder("miroir-agent"),
+			Peers:      wedgedPeers,
 		}
 		if err := reconciler.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to set up agent reconciler")
@@ -769,7 +803,7 @@ func main() {
 		// Scheduled online verify — the only cross-leg integrity check. Needs
 		// the DRBD kernel side, so it is gated on drbdReady like the sweeps.
 		addVerifyScheduler(mgr, nodeName, drbdReady, verifySchedule, drbdDriver)
-		addWedgeSampler(mgr, storageWedge)
+		addWedgeReporter(mgr, nodeName, storageWedge, wedgeTaint)
 		node := csi.NewNode(mgr.GetClient(), mgr.GetAPIReader(), nodeName, drbdDriver)
 		node.Wedge = storageWedge
 		serveCSI(mgr, csiSocket, identity, nil, node)
@@ -1009,43 +1043,37 @@ func addBarrierSweep(mgr manager.Manager, drbdReady bool, driver *drbd.Driver, f
 	}
 }
 
-// wedgeSampleInterval paces the node-scoped breaker's gauge: short enough to
-// show the jam building rather than only its aftermath, and cheap at one
-// /proc/<pid>/stat read per outstanding child.
-const wedgeSampleInterval = 30 * time.Second
-
-// addWedgeSampler publishes the node-scoped breaker's state on a timer and
-// logs its transitions. Sampled rather than event-driven because the count
-// self-heals: a gauge written only when a child strands would page forever
-// after the node recovered.
-func addWedgeSampler(mgr manager.Manager, w *backend.Wedge) {
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		ticker := time.NewTicker(wedgeSampleInterval)
-		defer ticker.Stop()
-		open := false
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-ticker.C:
-				agent.RecordNodeWedge(w)
-				// Edges only: a jammed node stays jammed until it reboots,
-				// and repeating the line every 30s buries it.
-				if tripped := w.Tripped(); tripped != open {
-					open = tripped
-					if tripped {
-						setupLog.Error(w.Err(), "node storage stack wedged; refusing further storage commands until this node reboots",
-							"stranded", w.Stranded())
-					} else {
-						setupLog.Info("node storage stack recovered; resuming storage commands")
-					}
-				}
-			}
-		}
-	})); err != nil {
-		setupLog.Error(err, "unable to add the wedge sampler")
+// addWedgeReporter publishes the node-scoped breaker outward: the gauge,
+// the StorageWedged condition auto-evict reads, the first-latch Event, and
+// (unless the operator owns node remediation) the NoSchedule taint.
+func addWedgeReporter(mgr manager.Manager, nodeName string, w *backend.Wedge, taint bool) {
+	if err := mgr.Add(&agent.WedgeReporter{
+		Client:   mgr.GetClient(),
+		NodeName: nodeName,
+		Wedge:    w,
+		Recorder: mgr.GetEventRecorder("miroir-agent"),
+		Taint:    taint,
+	}); err != nil {
+		setupLog.Error(err, "unable to add the wedge reporter")
 		os.Exit(1)
 	}
+}
+
+// addWedgedPeerWatch tracks which other nodes have wedged, so this node's
+// legs can leave their replication links out of the rendered config and
+// stop being vetoed on promotion. Opt-in: nil (fence inert) when off.
+func addWedgedPeerWatch(mgr manager.Manager, nodeName string, enabled, drbdReady bool) agent.PeerWedge {
+	// Nothing to fence without the DRBD kernel side either: a local-only
+	// node serves unreplicated volumes, which have no peers.
+	if !enabled || !drbdReady {
+		return nil
+	}
+	w := &agent.WedgedPeers{Reader: mgr.GetAPIReader(), NodeName: nodeName}
+	if err := mgr.Add(w); err != nil {
+		setupLog.Error(err, "unable to add the wedged-peer watcher")
+		os.Exit(1)
+	}
+	return w
 }
 
 // sweepOrphans removes DRBD state with no owning volume on this node,

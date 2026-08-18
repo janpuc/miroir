@@ -45,12 +45,14 @@ var metricEvictions = prometheus.NewCounterVec(prometheus.CounterOpts{
 }, []string{"kind"})
 
 // metricEvictStanddown counts passes where eviction refused to act on a
-// stale node. A rising multiple_stale rate flags an observer-side
+// dead-looking node. A rising multiple_stale rate flags an observer-side
 // problem; peer_connected flags a node cut off from the API server but
-// not from its peers; node_ready flags a broken agent on a live node.
+// not from its peers; node_ready flags a broken agent on a live node;
+// wedge_settling is the deliberate pause before acting on a fresh
+// StorageWedged condition.
 var metricEvictStanddown = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "miroir_autoevict_standdown_total",
-	Help: "Auto-evict passes that stood down instead of evicting, by reason (multiple_stale: more than one node's heartbeat is stale; peer_connected: a survivor still holds DRBD links to the stale node; node_ready: the node's kubelet still heartbeats, only the agent is gone).",
+	Help: "Auto-evict passes that stood down instead of evicting, by reason (multiple_stale: more than one node looks dead; peer_connected: a survivor still holds DRBD links to the stale node; node_ready: the node's kubelet still heartbeats, only the agent is gone; wedge_settling: the node's storage breaker latched too recently to act on).",
 }, []string{"reason"})
 
 func init() {

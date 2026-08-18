@@ -688,6 +688,80 @@ func TestNodeUnstageUnaffectedByClosedBreaker(t *testing.T) {
 	}
 }
 
+// countingDRBD records whether the staging pipeline reached the kernel at
+// all, which is what separates "refused at the gate" from "refused later".
+type countingDRBD struct{ calls int }
+
+func (d *countingDRBD) Status(context.Context, string) (drbd.Status, error) {
+	d.calls++
+	return drbd.Status{DiskState: drbd.DiskUpToDate}, nil
+}
+
+func blockStageReq() *csi.NodeStageVolumeRequest {
+	return &csi.NodeStageVolumeRequest{
+		VolumeId:          volPvc1,
+		StagingTargetPath: "/var/lib/kubelet/stage",
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	}
+}
+
+// Kubelet retries a failed stage forever. On a wedged node each retry
+// re-enters the jammed storage path, so staging must be refused at the gate
+// rather than hang the pod in ContainerCreating while the assertion storm
+// compounds.
+func TestNodeStageRefusesWhenNodeWedged(t *testing.T) {
+	drbdStatus := &countingDRBD{}
+	n := newNode(t, stagedVolume(), drbdStatus)
+	n.Wedge = wedgedBreaker()
+
+	_, err := n.NodeStageVolume(t.Context(), blockStageReq())
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("staging on a wedged node must be Unavailable (retriable), got %v", err)
+	}
+	if !strings.Contains(err.Error(), backend.ErrNodeWedged.Error()) {
+		t.Fatalf("stage error = %v, want it to name the node wedge and the reboot it needs", err)
+	}
+	if drbdStatus.calls != 0 {
+		t.Fatalf("the gate must short-circuit before the backend, got %d DRBD calls", drbdStatus.calls)
+	}
+}
+
+// A closed breaker must leave staging exactly as it was: through the gate
+// and on into the device lookup.
+func TestNodeStageUnaffectedByClosedBreaker(t *testing.T) {
+	drbdStatus := &countingDRBD{}
+	n := newNode(t, stagedVolume(), drbdStatus)
+	n.Wedge = fakeGate{}
+
+	// /dev/drbd1000 does not exist here, so the block path stops at its
+	// device stat — past the gate, which is the point.
+	_, err := n.NodeStageVolume(t.Context(), blockStageReq())
+	if err == nil || !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("stage error = %v, want the device-stat failure that proves the gate let it through", err)
+	}
+	if drbdStatus.calls != 1 {
+		t.Fatalf("a closed breaker must not change staging, got %d DRBD calls", drbdStatus.calls)
+	}
+}
+
+// An RWX volume is mounted over NFS from a gateway on another node and
+// never touches this node's jammed storage stack, so the wedge must not
+// widen the outage to volumes it cannot affect.
+func TestNodeStageNFSUnaffectedByWedge(t *testing.T) {
+	n := newNode(t, exportVolume("10.96.0.7"), fakeDRBDStatus{})
+	n.Mounter = mount.NewSafeFormatAndMount(mount.NewFakeMounter(nil), utilexec.New())
+	n.Wedge = wedgedBreaker()
+
+	req := nfsStageReq(mountCap())
+	req.StagingTargetPath = t.TempDir()
+	if _, err := n.NodeStageVolume(t.Context(), req); err != nil {
+		t.Fatalf("RWX staging must survive a local storage wedge: %v", err)
+	}
+}
+
 // A latch must not block unstage: the filesystem still drains.
 func TestNodeUnstageDrainsOnLatchedBreaker(t *testing.T) {
 	target := t.TempDir()

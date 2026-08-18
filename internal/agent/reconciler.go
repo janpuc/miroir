@@ -76,6 +76,10 @@ type VolumeReconciler struct {
 	ProcDir string
 	// Recorder emits the TeardownWedged warning; optional.
 	Recorder events.EventRecorder
+	// Peers reports which other nodes' storage stacks have wedged, so
+	// their replication links can be left out of the rendered config and
+	// stop vetoing promotion here. nil disables peer fencing.
+	Peers PeerWedge
 
 	// realized caches the last fully realized state per volume so the
 	// steady-state poll only re-execs `drbdsetup status` instead of the
@@ -294,7 +298,12 @@ func (r *VolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				"volume", vol.Name, "error", err)
 		}
 	}
-	resource := drbdResource(vol, r.NodeName, dev, minor, localDiskless, discardGranularity)
+	fenced := fencedPeers(vol, r.NodeName, localDiskless, r.Peers)
+	if len(fenced) > 0 {
+		log.Info("fencing wedged peers out of the resource config so this leg can be promoted",
+			"volume", vol.Name, "peers", slices.Sorted(maps.Keys(fenced)))
+	}
+	resource := drbdResource(vol, r.NodeName, dev, minor, localDiskless, discardGranularity, fenced)
 	if err := r.DRBD.Apply(ctx, resource); err != nil {
 		return ctrl.Result{}, r.reportError(ctx, vol, err)
 	}
@@ -704,11 +713,13 @@ func (r *VolumeReconciler) finishClone(ctx context.Context, be backend.Backend, 
 // drbdResource maps the CRD desired state to a render input. Entries the
 // membership reconciler has not completed yet (no address) are left out:
 // rendering them would produce a config DRBD cannot parse, and the peer
-// cannot connect before completion anyway.
-func drbdResource(vol *miroirv1alpha1.MiroirVolume, localNode, localDisk string, minor int32, localDiskless bool, discardGranularity int64) drbd.Resource {
+// cannot connect before completion anyway. So are the nodes in fenced —
+// see fencedPeers for what that costs and what it gates on; adjust turns
+// their absence into a del-peer, which is the whole point.
+func drbdResource(vol *miroirv1alpha1.MiroirVolume, localNode, localDisk string, minor int32, localDiskless bool, discardGranularity int64, fenced map[string]bool) drbd.Resource {
 	peers := make([]drbd.Peer, 0, len(vol.Spec.Replicas)+len(vol.Spec.Clients))
 	for _, rep := range vol.Spec.Replicas {
-		if rep.Address == "" {
+		if rep.Address == "" || fenced[rep.Node] {
 			continue
 		}
 		peers = append(peers, drbd.Peer{
@@ -719,7 +730,7 @@ func drbdResource(vol *miroirv1alpha1.MiroirVolume, localNode, localDisk string,
 		})
 	}
 	for _, cl := range vol.Spec.Clients {
-		if cl.Address == "" {
+		if cl.Address == "" || fenced[cl.Node] {
 			continue
 		}
 		peers = append(peers, drbd.Peer{

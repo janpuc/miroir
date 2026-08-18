@@ -147,9 +147,11 @@ rules:
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  {{- /* patch: the agent taints its own Node while its storage stack is
+         wedged, so the scheduler stops placing consumers there. */}}
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch"{{ if .Values.agent.wedgeTaint }}, "patch"{{ end }}]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
