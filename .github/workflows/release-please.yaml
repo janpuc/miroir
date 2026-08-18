@@ -19,11 +19,31 @@ jobs:
   release-please:
     runs-on: ubuntu-24.04
     permissions:
+      # actions: write dispatches the Release workflow on the fallback path
+      # below, where GITHUB_TOKEN cannot trigger it any other way.
+      actions: write
       contents: write
       issues: write
       pull-requests: write
     steps:
+      # The release bot is an org-level GitHub App. A fork has no access to
+      # it, so its absence has to degrade to GITHUB_TOKEN rather than fail
+      # the job. `secrets` is not one of the contexts available to a step
+      # `if`, so the presence check becomes an output first.
+      - name: Look for the release bot app
+        id: bot
+        env:
+          BOT_CLIENT_ID: ${{ secrets.BOT_CLIENT_ID }}
+        run: |
+          if [ -n "${BOT_CLIENT_ID}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no release bot app configured; falling back to GITHUB_TOKEN"
+          fi
+
       - name: Generate Token
+        if: ${{ steps.bot.outputs.present == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -34,8 +54,23 @@ jobs:
           permission-pull-requests: write
 
       - name: Release Please
+        id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Events raised with GITHUB_TOKEN do not start new workflow runs, so a
+      # release cut on the fallback path would never reach the Release
+      # workflow's `release: published` trigger and nothing would be
+      # published. workflow_dispatch is the documented exception to that
+      # rule; dispatched at the tag it behaves exactly like the release
+      # event, down to the semver image tags derived from the ref.
+      - name: Start the release build
+        if: ${{ steps.bot.outputs.present != 'true' && steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh workflow run release.yaml --ref "${TAG}"

@@ -20,7 +20,24 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      # This runs on the org's bot app, which a fork cannot reach. Skip
+      # rather than fail nightly: triage is the upstream repo's job, and a
+      # red cron in every fork only hides its real failures. `secrets` is
+      # not available to a step `if`, so check it into an output first.
+      - name: Look for the bot app
+        id: bot
+        env:
+          BOT_CLIENT_ID: ${{ secrets.BOT_CLIENT_ID }}
+        run: |
+          if [ -n "${BOT_CLIENT_ID}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no bot app configured; skipping stale triage"
+          fi
+
       - name: Generate Token
+        if: ${{ steps.bot.outputs.present == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -30,6 +47,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Stale
+        if: ${{ steps.bot.outputs.present == 'true' }}
         uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
         with:
           repo-token: ${{ steps.app-token.outputs.token }}

@@ -55,7 +55,24 @@ jobs:
       )
     runs-on: ubuntu-24.04
     steps:
+      # Renovate runs centrally: this job only dispatches the org's shared
+      # workflow, through the org's bot app. Neither exists in a fork, so
+      # skip instead of failing on every push. `secrets` is not available
+      # to a step `if`, so check it into an output first.
+      - name: Look for the bot app
+        id: bot
+        env:
+          BOT_CLIENT_ID: ${{ secrets.BOT_CLIENT_ID }}
+        run: |
+          if [ -n "${BOT_CLIENT_ID}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no bot app configured; skipping the central Renovate run"
+          fi
+
       - name: Generate Token
+        if: ${{ steps.bot.outputs.present == 'true' }}
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -67,6 +84,7 @@ jobs:
 
       - name: Run Renovate
         id: dispatch
+        if: ${{ steps.bot.outputs.present == 'true' }}
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO_NAME: ${{ github.event.repository.name }}
@@ -78,7 +96,7 @@ jobs:
           echo "run_id=${RUN_URL##*/}" >> "$GITHUB_OUTPUT"
 
       - name: Await Renovate Completion
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: ${{ steps.bot.outputs.present == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           RUN_ID: ${{ steps.dispatch.outputs.run_id }}
@@ -89,7 +107,7 @@ jobs:
             --exit-status
 
       - name: Renovate Output
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: ${{ steps.bot.outputs.present == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           RUN_ID: ${{ steps.dispatch.outputs.run_id }}
