@@ -221,9 +221,8 @@ func EnsureFilesystem(ctx context.Context, d Deps, vol *miroirv1alpha1.MiroirVol
 			}
 		}
 
-		// FormatAndMount formats only when the device has no filesystem —
-		// the mkfs-if-blank step.
-		if err := d.Mounter.FormatAndMount(dev, target, fsType, xfsCloneMountFlags(vol, format, flags)); err != nil {
+		if err := mountStaged(d, dev, target, fsType,
+			xfsCloneMountFlags(vol, format, flags), format == ""); err != nil {
 			if rerr := recoverFrozenBdev(ctx, d, vol, dev, err); rerr != nil {
 				return rerr
 			}
@@ -268,6 +267,32 @@ func EnsureFilesystem(ctx context.Context, d Deps, vol *miroirv1alpha1.MiroirVol
 		return status.Errorf(codes.Internal, "record activated flag: %v", err)
 	}
 	return nil
+}
+
+// mountStaged mounts dev at target, formatting first only when the caller
+// already probed the device and found it blank.
+//
+// The format decision must not be delegated to FormatAndMount. That helper
+// re-probes with blkid and formats whenever the probe comes back empty, and
+// blkid answers empty for two different things: a device with no filesystem,
+// and a device it could not read at all — exit status 2 covers both. A DRBD
+// device whose filesystem is frozen is unreadable, so a stage that races a
+// leaked freeze arrives with a populated device, gets an empty second probe,
+// and mkfs's live data. The blank-device refusal above cannot catch that: it
+// ruled on the first probe, which still saw the filesystem.
+//
+// Passing the decision down means the probe that guards the data is the same
+// probe that authorises the format. The already-formatted path mounts without
+// the incidental `fsck -a` that FormatAndMount runs; journal replay on mount
+// covers the unclean-shutdown case, and fsck on a device that may be frozen is
+// itself unsafe.
+func mountStaged(d Deps, dev, target, fsType string, flags []string, blank bool) error {
+	if blank {
+		return d.Mounter.FormatAndMount(dev, target, fsType, flags)
+	}
+	// FormatAndMount appends this before mounting; match it so switching
+	// paths cannot change the resulting mount.
+	return d.Mounter.Mount(dev, target, fsType, append(slices.Clone(flags), "defaults"))
 }
 
 // XFS refuses to mount a snapshot-derived filesystem while its source with

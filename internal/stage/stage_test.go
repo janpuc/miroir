@@ -25,6 +25,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	mount "k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
+	testingexec "k8s.io/utils/exec/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	miroirv1alpha1 "github.com/home-operations/miroir/api/v1alpha1"
@@ -115,6 +118,81 @@ func TestRecoverFrozenBdevNeedsRestarter(t *testing.T) {
 	err := recoverFrozenBdev(t.Context(), Deps{DRBD: statusOnlyDRBD{}}, replicatedVolume(), "/dev/drbd1378", errFrozenMount)
 	if err != nil {
 		t.Fatalf("a status-only DRBD dep must fall through to the generic wrap, got %v", err)
+	}
+}
+
+// recordingExec scripts each shell-out and records the binary invoked, so a
+// test can assert not just what a path did but that it shelled out at all.
+// An empty script panics on the first unexpected command.
+func recordingExec(ran *[]string, outs ...struct {
+	out string
+	err error
+},
+) *testingexec.FakeExec {
+	fe := &testingexec.FakeExec{}
+	for _, o := range outs {
+		fe.CommandScript = append(fe.CommandScript,
+			func(cmd string, args ...string) utilexec.Cmd {
+				*ran = append(*ran, cmd)
+				c := &testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{
+					func() ([]byte, []byte, error) { return []byte(o.out), nil, o.err },
+				}}
+				return testingexec.InitFakeCmd(c, cmd, args...)
+			})
+	}
+	return fe
+}
+
+// A device the caller already probed as formatted must be mounted without a
+// second opinion. FormatAndMount re-probes with blkid and mkfs's whenever that
+// probe reads empty — and blkid reports empty both for a blank device and for
+// one it could not read, which is what a frozen DRBD device looks like. Going
+// through it here is how a populated volume gets reformatted between the
+// caller's probe and the mount.
+func TestMountStagedFormattedDeviceNeverReprobes(t *testing.T) {
+	var ran []string
+	fm := mount.NewFakeMounter(nil)
+	fe := recordingExec(&ran)
+	d := Deps{Mounter: mount.NewSafeFormatAndMount(fm, fe)}
+
+	if err := mountStaged(d, "/dev/drbd1378", "/stage/globalmount", "ext4",
+		[]string{"noatime"}, false); err != nil {
+		t.Fatalf("mounting an already-formatted device must succeed: %v", err)
+	}
+	if len(ran) != 0 {
+		t.Fatalf("the formatted path must not shell out at all, ran %v", ran)
+	}
+	if len(fm.MountPoints) != 1 || fm.MountPoints[0].Device != "/dev/drbd1378" {
+		t.Fatalf("the device must be mounted: %+v", fm.MountPoints)
+	}
+	if !slices.Contains(fm.MountPoints[0].Opts, "defaults") ||
+		!slices.Contains(fm.MountPoints[0].Opts, "noatime") {
+		t.Fatalf("mount options must match what FormatAndMount would have used: %v",
+			fm.MountPoints[0].Opts)
+	}
+}
+
+// The blank path is the only one allowed to reach mkfs.
+func TestMountStagedBlankDeviceFormats(t *testing.T) {
+	var ran []string
+	fm := mount.NewFakeMounter(nil)
+	fe := recordingExec(&ran,
+		struct {
+			out string
+			err error
+		}{"", utilexec.CodeExitError{Err: errors.New("blkid"), Code: 2}},
+		struct {
+			out string
+			err error
+		}{"", nil},
+	)
+	d := Deps{Mounter: mount.NewSafeFormatAndMount(fm, fe)}
+
+	if err := mountStaged(d, "/dev/drbd1378", "/stage/globalmount", "ext4", nil, true); err != nil {
+		t.Fatalf("a blank device must be formatted and mounted: %v", err)
+	}
+	if !slices.Equal(ran, []string{"blkid", "mkfs.ext4"}) {
+		t.Fatalf("the blank path must probe then mkfs, ran %v", ran)
 	}
 }
 
