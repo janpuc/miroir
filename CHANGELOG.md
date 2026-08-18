@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.11.23](https://github.com/janpuc/miroir/compare/0.11.22...0.11.23) (2026-08-18)
+
+
+### Features
+
+* contain the blast radius of a wedged storage node ([b58c307](https://github.com/janpuc/miroir/commit/b58c30772a40270d69651bd001ada2b2da308a67))
+
+
+### Bug Fixes
+
+* **go:** update module github.com/onsi/ginkgo/v2 (v2.32.0 → v2.32.1) ([#425](https://github.com/janpuc/miroir/issues/425)) ([6154a07](https://github.com/janpuc/miroir/commit/6154a07b53cfa838be978d578adf9497a10206b0))
+* **go:** update module google.golang.org/protobuf (f2248ac → 644d026) ([#412](https://github.com/janpuc/miroir/issues/412)) ([20d94d4](https://github.com/janpuc/miroir/commit/20d94d4ffd72666179c21035bbffa77502648956))
+* **go:** update module google.golang.org/protobuf (v1.36.12-0.20260806062936-644d0267c26e → v1.36.12) ([#424](https://github.com/janpuc/miroir/issues/424)) ([ec4f729](https://github.com/janpuc/miroir/commit/ec4f72981b7d4e8786c6cdf76a1e085ab9eb8cb5))
+* **stage:** never format a device whose filesystem probe failed ([499fdfc](https://github.com/janpuc/miroir/commit/499fdfc76ffa5494ef2c5ccd71e3194e7cb83eda))
+
+
+### Continuous Integration
+
+* **github-action:** Update action docker/github-builder (v1.15.0 → v1.16.0) ([#420](https://github.com/janpuc/miroir/issues/420)) ([ca7d164](https://github.com/janpuc/miroir/commit/ca7d1646b8a79768a0e52725b0d822afaf282c9b))
+* make the release pipeline work from a fork ([2e4d642](https://github.com/janpuc/miroir/commit/2e4d642dce962a5ace320eb7ae3769e1895bcab9))
+
+
+### Miscellaneous Chores
+
+* **mise:** Update mise tools ([#422](https://github.com/janpuc/miroir/issues/422)) ([cb70183](https://github.com/janpuc/miroir/commit/cb70183b4f464e0a38ca6f56fd96f8ec7eccd75a))
+* **mise:** update tool go:golang.org/x/vuln/cmd/govulncheck (1.6.0 → v1.7.0) ([#428](https://github.com/janpuc/miroir/issues/428)) ([f1105d7](https://github.com/janpuc/miroir/commit/f1105d7d140ae95e6a4f0984845ab64a423fb29a))
+* **mise:** Update tool oxfmt (0.62.0 → 0.63.0) ([#426](https://github.com/janpuc/miroir/issues/426)) ([dbf65c1](https://github.com/janpuc/miroir/commit/dbf65c1b8fade793dd8d0f185c9acc33ebd1654b))
+
 ## [0.11.22](https://github.com/home-operations/miroir/compare/0.11.21...0.11.22) (2026-08-07)
 
 
