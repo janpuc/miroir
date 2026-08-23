@@ -105,6 +105,13 @@ type VolumeReconciler struct {
 	// forever with the cause swallowed (issue #195). See reportBusy.
 	busyMu    sync.Mutex
 	busyFails map[string]int
+
+	// probeFails counts consecutive errored reconcile passes per volume.
+	// Past probeFailLimit the slot's persisted DRBD fields degrade to
+	// unverifiable (drbd.DiskUnknown, disconnected) instead of freezing at
+	// the last healthy probe — see reportError and probeFailLimit.
+	probeMu    sync.Mutex
+	probeFails map[string]int
 }
 
 // realizedState is the fingerprint of a completed full pass: repeating
@@ -266,6 +273,7 @@ func (r *VolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			}); err != nil {
 				return ctrl.Result{}, err
 			}
+			r.clearProbeFails(vol.Name)
 			r.storeRealized(vol.Generation, vol.Name, drbd.Status{}, false)
 			// Unreplicated volumes emit no DRBD events and no status
 			// wakeups; without a requeue, out-of-band backend drift (the
@@ -362,6 +370,7 @@ func (r *VolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
+	r.clearProbeFails(vol.Name)
 	r.storeIfSettled(vol, st, requeue, reportSize, splitActive || stuckActive)
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
@@ -490,6 +499,7 @@ func (r *VolumeReconciler) volumeGone(name string, err error) error {
 	r.dropRealized(name)
 	r.dropRecovery(name)
 	r.clearBusyFails(name)
+	r.clearProbeFails(name)
 	return nil
 }
 
@@ -522,6 +532,7 @@ func (r *VolumeReconciler) reconcileDeletion(ctx context.Context, vol *miroirv1a
 	r.dropRealized(vol.Name)
 	r.dropRecovery(vol.Name)
 	r.clearBusyFails(vol.Name)
+	r.clearProbeFails(vol.Name)
 	return ctrl.Result{}, r.removeFinalizer(ctx, vol)
 }
 
@@ -1127,7 +1138,9 @@ func birthInitPending(vol *miroirv1alpha1.MiroirVolume, st drbd.Status, self str
 // reconcileRemoval tears down a replica that was removed from
 // spec.replicas while the volume lives on. It only proceeds when losing
 // this leg cannot lose data: every remaining replica must be UpToDate and
-// connected, and no snapshot may reference the volume — snapshots exist as
+// connected (peers silent past removalStaleTolerance are instead weighed
+// by removalBlocked against the local copy), and no snapshot may reference
+// the volume — snapshots exist as
 // backend CoW state on every replica, and restores expect to find them
 // wherever the volume is placed.
 func (r *VolumeReconciler) reconcileRemoval(ctx context.Context, vol *miroirv1alpha1.MiroirVolume) (ctrl.Result, error) {
@@ -1156,6 +1169,7 @@ func (r *VolumeReconciler) reconcileRemoval(ctx context.Context, vol *miroirv1al
 	r.dropRealized(vol.Name)
 	r.dropRecovery(vol.Name)
 	r.clearBusyFails(vol.Name)
+	r.clearProbeFails(vol.Name)
 	// Drop this node's status slot — merge-patch null deletes the key.
 	// Best-effort ordering: a crash here leaves a stale slot, which
 	// nothing reads (phase and growth iterate spec.replicas only).
@@ -1172,6 +1186,11 @@ func (r *VolumeReconciler) reconcileRemoval(ctx context.Context, vol *miroirv1al
 // when it is safe. The remaining replicas' health is read from the CRD
 // status the peers report — by removal time the peers have already dropped
 // this node from their configs, so the local kernel's view of them is gone.
+// A peer that stopped writing status past removalStaleTolerance is treated
+// as unavailable rather than trusted or waited for: its frozen claims can
+// hold this gate closed forever while the node is down. The one hard stop
+// then is this node holding the only live UpToDate copy, checked against
+// the local kernel — see localCopyHealthy.
 func (r *VolumeReconciler) removalBlocked(ctx context.Context, vol *miroirv1alpha1.MiroirVolume) string {
 	if vol.Spec.DRBD == nil {
 		// An unreplicated volume's lone entry moved: there is no peer
@@ -1195,14 +1214,32 @@ func (r *VolumeReconciler) removalBlocked(ctx context.Context, vol *miroirv1alph
 			}
 		}
 	}
+	var staleNodes []string
+	freshHealthy := 0
 	for _, rep := range vol.Spec.Replicas {
 		if rep.Diskless {
 			continue
 		}
 		st, ok := vol.Status.PerNode[rep.Node]
+		// A slot whose agent stopped stamping LastProbedAt long ago holds
+		// claims nobody can verify. Trusting a frozen healthy claim would
+		// wave the removal through on dead data, and requiring freshness
+		// blocks removal forever behind a dead node — the deadlock that
+		// froze a staged-clone teardown for hours while full-volume
+		// deletion (which supersedes these gates) went straight through.
+		// Tally the replica as unavailable and let the last-copy check
+		// below decide.
+		if ok && staleBeyondRemovalTolerance(st) {
+			staleNodes = append(staleNodes, rep.Node)
+			continue
+		}
 		if !ok || st.DiskState != drbd.DiskUpToDate || !st.Connected {
 			return "replica on " + rep.Node + " is not UpToDate and connected"
 		}
+		freshHealthy++
+	}
+	if len(staleNodes) > 0 && freshHealthy == 0 && r.localCopyHealthy(ctx, vol) {
+		return staleRemovalBlockedReason(staleNodes)
 	}
 	return ""
 }
@@ -1606,6 +1643,20 @@ func (r *VolumeReconciler) reportError(ctx context.Context, vol *miroirv1alpha1.
 	// hard-Failed while the device exists.
 	st := vol.Status.PerNode[r.NodeName]
 	st.Message = cause.Error()
+	// LastProbedAt is deliberately not stamped: an errored pass verified
+	// nothing, and the timestamp records the last successful probe. For
+	// the same reason the persisted DRBD fields stop being advertised once
+	// the failures pile up — a frozen UpToDate from a hot-looping agent is
+	// exactly what peers gate replica removal and auto-evict on (see
+	// probeFailLimit).
+	fails := r.bumpProbeFails(vol.Name)
+	verifiable := st.DiskState != "" && st.DiskState != drbd.DiskUnknown
+	if verifiable && fails >= probeFailLimit {
+		ctrl.LoggerFrom(ctx).Info("degrading the advertised disk state to Unknown after repeated failed probes",
+			"volume", vol.Name, "consecutiveFailures", fails, "lastReported", st.DiskState)
+		st.DiskState = drbd.DiskUnknown
+		st.Connected = false
+	}
 	if err := r.patchStatus(ctx, vol, st); err != nil {
 		return err
 	}
