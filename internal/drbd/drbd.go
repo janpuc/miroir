@@ -1201,6 +1201,15 @@ const DiskInconsistent = "Inconsistent"
 // interval of an auto-diskful conversion (see probeMetadata).
 const DiskDiskless = "Diskless"
 
+// DiskUnknown is not a kernel disk state: the agent stamps it into its
+// own status slot once enough consecutive reconcile passes have failed
+// that the persisted DiskState is a claim it can no longer verify (see
+// agent.reportError). Without it, an agent hot-looping on a broken
+// backing keeps advertising the last state it ever probed, and peers
+// gate replica removal and eviction on that frozen claim. The next
+// successful full pass replaces it with the kernel's real state.
+const DiskUnknown = "Unknown"
+
 // diskDetaching is the transient disk state while the kernel drains a
 // detach. Seen at teardown entry (with the connections already gone) it
 // means a previous down was killed mid-flight — see ErrWedged.
