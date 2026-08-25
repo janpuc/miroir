@@ -52,7 +52,7 @@ Two things are worth knowing before the first release from a fork:
   re-publish button:
 
   ```bash
-  gh workflow run release.yaml --ref 0.11.23
+  gh workflow run release.yaml --ref 0.11.23-janpuc.1
   ```
 
   One consequence of the fallback: CI does not run on the release PR

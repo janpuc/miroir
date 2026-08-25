@@ -24,6 +24,7 @@ package stage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	mount "k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	miroirv1alpha1 "github.com/home-operations/miroir/api/v1alpha1"
@@ -200,7 +202,7 @@ func EnsureFilesystem(ctx context.Context, d Deps, vol *miroirv1alpha1.MiroirVol
 		// mkfs-if-blank is allowed exactly once per volume: a blank device on
 		// a volume that ever carried a filesystem is data loss (diverged
 		// replica, torn clone), and reformatting would silently finish it.
-		format, err := d.Mounter.GetDiskFormat(dev)
+		format, err := probeDiskFormat(d.Mounter.Exec, dev)
 		if err != nil {
 			return status.Errorf(codes.Internal, "probe filesystem on %s: %v", dev, err)
 		}
@@ -267,6 +269,37 @@ func EnsureFilesystem(ctx context.Context, d Deps, vol *miroirv1alpha1.MiroirVol
 		return status.Errorf(codes.Internal, "record activated flag: %v", err)
 	}
 	return nil
+}
+
+func probeDiskFormat(exec utilexec.Interface, disk string) (string, error) {
+	out, err := exec.Command("blkid", "-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", disk).CombinedOutput()
+	if err != nil {
+		if exit, ok := err.(utilexec.ExitError); ok && exit.ExitStatus() == 2 {
+			return "", nil
+		}
+		return "", err
+	}
+
+	var fsType, partitionTableType string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return "", fmt.Errorf("blkid returns invalid output: %s", out)
+		}
+		switch key {
+		case "TYPE":
+			fsType = value
+		case "PTTYPE":
+			partitionTableType = value
+		}
+	}
+	if partitionTableType != "" {
+		return "unknown data, probably partitions", nil
+	}
+	return fsType, nil
 }
 
 // mountStaged mounts dev at target, formatting first only when the caller

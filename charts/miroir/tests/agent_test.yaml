@@ -43,7 +43,7 @@ tests:
       # repo:semver shape rather than a hardcoded version.
       - matchRegex:
           path: spec.template.spec.containers[0].image
-          pattern: ^ghcr\.io/home-operations/miroir-agent:\d+\.\d+\.\d+$
+          pattern: ^ghcr\.io/home-operations/miroir-agent:\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$
       - equal:
           path: spec.template.spec.containers[0].imagePullPolicy
           value: IfNotPresent

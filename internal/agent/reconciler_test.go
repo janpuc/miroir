@@ -3532,6 +3532,40 @@ func TestReconcileStuckResyncCyclesAfterConfirmation(t *testing.T) {
 	fe.calledWith(t, "drbdsetup connect pvc-1 1")
 }
 
+func TestRecoverStalledSyncTargetRequiresNoReceiveProgress(t *testing.T) {
+	fe := &fakeDRBDExec{}
+	r := &VolumeReconciler{DRBD: &drbd.Driver{Exec: fe.run}}
+	v := vol(volPvc1, nodeA, nodeB)
+	st := drbd.Status{
+		DiskState: drbd.DiskInconsistent,
+		SyncTargetPeers: map[int32]drbd.ResyncProgress{
+			1: {OutOfSyncKiB: 4096, ReceivedKiB: 10},
+		},
+	}
+	if !r.recoverStalledSyncTarget(t.Context(), v, st, false) {
+		t.Fatal("active SyncTarget must stay in the recovery path")
+	}
+	fe.notCalledWith(t, "drbdadm disconnect")
+
+	r.recoveryMu.Lock()
+	observation := r.resyncTargets[volPvc1]
+	observation.lastProgress = time.Now().Add(-stalledSyncTargetThreshold - time.Second)
+	r.resyncTargets[volPvc1] = observation
+	r.recoveryMu.Unlock()
+	st.SyncTargetPeers[1] = drbd.ResyncProgress{OutOfSyncKiB: 3072, ReceivedKiB: 20}
+	r.recoverStalledSyncTarget(t.Context(), v, st, false)
+	fe.notCalledWith(t, "drbdadm disconnect")
+
+	r.recoveryMu.Lock()
+	observation = r.resyncTargets[volPvc1]
+	observation.lastProgress = time.Now().Add(-stalledSyncTargetThreshold - time.Second)
+	r.resyncTargets[volPvc1] = observation
+	r.recoveryMu.Unlock()
+	r.recoverStalledSyncTarget(t.Context(), v, st, false)
+	fe.calledWith(t, "drbdadm disconnect pvc-1")
+	fe.calledWith(t, "drbdadm connect --discard-my-data pvc-1")
+}
+
 // Within the confirmation window nothing is cycled, however many passes run
 // (DRBD events can requeue the volume several times per interval).
 func TestReconcileStuckResyncDebounced(t *testing.T) {

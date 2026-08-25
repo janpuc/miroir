@@ -634,9 +634,8 @@ func statfsAt(path string) (fsStatResult, error) {
 	if err := unix.Statfs(path, &st); err != nil {
 		return fsStatResult{}, fmt.Errorf("statfs %s: %w", path, err)
 	}
-	// Fragment and block sizes are in units defined by the filesystem;
-	// the kernel returns them as int64 and the math is straight.
-	bsize := st.Bsize
+	// Statfs_t.Bsize is int64 on Linux and uint32 on Darwin.
+	bsize := int64(st.Bsize) //nolint:unconvert
 	total := int64(st.Blocks) * bsize
 	free := int64(st.Bavail) * bsize // Bavail: blocks free to non-root
 	used := total - int64(st.Bfree)*bsize

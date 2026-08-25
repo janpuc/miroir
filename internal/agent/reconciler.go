@@ -98,6 +98,10 @@ type VolumeReconciler struct {
 	// status snapshot mid real handshake is never acted on. See
 	// recoverStuckResync.
 	stuckSince map[string]time.Time
+	// resyncTargets tracks target-side receive progress across polls. A DRBD
+	// resync can remain in SyncTarget forever while moving no data, which is a
+	// different terminal shape from the stranded bitmap above.
+	resyncTargets map[string]resyncTargetObservation
 
 	// busyFails counts consecutive ErrBusy teardown outcomes per volume.
 	// Past busyFailLimit the loop escalates — Warning Event, status
@@ -133,6 +137,15 @@ const deepCheckInterval = 5 * time.Minute
 // drbdPollInterval refreshes DRBD state in the CRD: connection/disk state
 // changes in the kernel without generating Kubernetes events.
 const drbdPollInterval = 30 * time.Second
+
+const stalledSyncTargetThreshold = 2 * drbdPollInterval
+
+type resyncTargetObservation struct {
+	peerID       int32
+	receivedKiB  int64
+	outOfSyncKiB int64
+	lastProgress time.Time
+}
 
 // StaleProbeThreshold bounds how long a replica's LastProbedAt can age
 // before computePhase reads it as stale — the agent can no longer reach
@@ -340,6 +353,7 @@ func (r *VolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	connected := diskfulPeersConnected(st, vol, r.NodeName)
 	splitActive := r.handleSplitBrain(ctx, vol, resource, st, connected)
+	stalledTargetActive := r.recoverStalledSyncTarget(ctx, vol, st, localDiskless)
 	stuckActive := r.recoverStuckResync(ctx, vol, st, localDiskless)
 	diskFailed := diskFailedLatch(vol, r.NodeName, st, localDiskless)
 	if !localDiskless {
@@ -371,7 +385,7 @@ func (r *VolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 	r.clearProbeFails(vol.Name)
-	r.storeIfSettled(vol, st, requeue, reportSize, splitActive || stuckActive)
+	r.storeIfSettled(vol, st, requeue, reportSize, splitActive || stalledTargetActive || stuckActive)
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
@@ -460,6 +474,7 @@ func statusEqual(a, b drbd.Status) bool {
 		a.ResyncPercent == b.ResyncPercent &&
 		a.Quorum == b.Quorum &&
 		a.OutOfSyncKiB == b.OutOfSyncKiB &&
+		maps.Equal(a.SyncTargetPeers, b.SyncTargetPeers) &&
 		maps.Equal(a.StuckResyncPeers, b.StuckResyncPeers) &&
 		maps.Equal(a.StaleBitmapPeers, b.StaleBitmapPeers) &&
 		maps.Equal(a.PeerConnected, b.PeerConnected) &&
@@ -860,6 +875,60 @@ func peerReportedSplitBrain(vol *miroirv1alpha1.MiroirVolume, self string) bool 
 		}
 	}
 	return false
+}
+
+// recoverStalledSyncTarget detects the DRBD 9.3 shape where an Inconsistent
+// leg remains an unsuspended SyncTarget but receives no data. A healthy
+// transfer advances its received counter or reduces out-of-sync work; if
+// neither happens for two complete polls, reconnecting with
+// --discard-my-data re-elects the already UpToDate peer as the source.
+func (r *VolumeReconciler) recoverStalledSyncTarget(ctx context.Context, vol *miroirv1alpha1.MiroirVolume, st drbd.Status, localDiskless bool) bool {
+	if localDiskless || st.DiskState != drbd.DiskInconsistent || len(st.SyncTargetPeers) == 0 {
+		r.recoveryMu.Lock()
+		delete(r.resyncTargets, vol.Name)
+		r.recoveryMu.Unlock()
+		return false
+	}
+
+	peerID := slices.Sorted(maps.Keys(st.SyncTargetPeers))[0]
+	progress := st.SyncTargetPeers[peerID]
+	now := time.Now()
+	r.recoveryMu.Lock()
+	previous, seen := r.resyncTargets[vol.Name]
+	if !seen || previous.peerID != peerID || progress.ReceivedKiB < previous.receivedKiB ||
+		progress.ReceivedKiB > previous.receivedKiB || progress.OutOfSyncKiB < previous.outOfSyncKiB {
+		if r.resyncTargets == nil {
+			r.resyncTargets = map[string]resyncTargetObservation{}
+		}
+		r.resyncTargets[vol.Name] = resyncTargetObservation{
+			peerID:       peerID,
+			receivedKiB:  progress.ReceivedKiB,
+			outOfSyncKiB: progress.OutOfSyncKiB,
+			lastProgress: now,
+		}
+		r.recoveryMu.Unlock()
+		return true
+	}
+	if now.Sub(previous.lastProgress) < stalledSyncTargetThreshold {
+		r.recoveryMu.Unlock()
+		return true
+	}
+	previous.lastProgress = now
+	r.resyncTargets[vol.Name] = previous
+	r.recoveryMu.Unlock()
+
+	log := ctrl.LoggerFrom(ctx)
+	log.Info("restarting a stalled target-side resync",
+		"volume", vol.Name, "peerNodeID", peerID, "outOfSyncKiB", progress.OutOfSyncKiB)
+	if err := r.DRBD.RecoverStalledSyncTarget(ctx, vol.Name); err != nil {
+		log.Error(err, "stalled SyncTarget recovery failed", "volume", vol.Name, "peerNodeID", peerID)
+		return true
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(vol, nil, corev1.EventTypeWarning, "StalledSyncTargetRecovered", "ReconnectDiscardingLocal",
+			"DRBD SyncTarget from peer node %d stopped receiving data; reconnected the Inconsistent local leg with --discard-my-data", peerID)
+	}
+	return true
 }
 
 // recoverStuckResync heals the two out-of-sync bitmaps DRBD leaves behind

@@ -1580,7 +1580,7 @@ func TestStatusResyncPercent(t *testing.T) {
 		cmdDrbdsetupStatus: `[{"name":"` + volPvc1 + `",
 			"devices":[{"disk-state":"Inconsistent","quorum":true}],
 			"connections":[{"peer-node-id":1,"connection-state":"Connected",
-				"peer_devices":[{"replication-state":"SyncTarget","percent-in-sync":42.5,"out-of-sync":2048}]}]}]`,
+				"peer_devices":[{"replication-state":"SyncTarget","peer-disk-state":"UpToDate","resync-suspended":"no","percent-in-sync":42.5,"out-of-sync":2048,"received":64}]}]}]`,
 	}}
 	d := &Driver{StateDir: t.TempDir(), Exec: fe.run, Mknod: fakeMknod}
 	s, err := d.Status(t.Context(), volPvc1)
@@ -1592,6 +1592,9 @@ func TestStatusResyncPercent(t *testing.T) {
 	}
 	if !s.Quorum || s.OutOfSyncKiB != 2048 {
 		t.Fatalf("want Quorum with OutOfSyncKiB 2048, got %+v", s)
+	}
+	if got := s.SyncTargetPeers[1]; got != (ResyncProgress{OutOfSyncKiB: 2048, ReceivedKiB: 64}) {
+		t.Fatalf("target-side progress = %+v", got)
 	}
 }
 
@@ -1738,6 +1741,34 @@ func TestCyclePeerConnectionDisconnectFails(t *testing.T) {
 		t.Fatal("want disconnect error")
 	}
 	fe.notCalledWith(t, "drbdsetup connect")
+}
+
+func TestRecoverStalledSyncTargetReconnectsDiscardingLocal(t *testing.T) {
+	fe := &fakeExec{}
+	d := &Driver{StateDir: t.TempDir(), Exec: fe.run, Mknod: fakeMknod}
+	if err := d.RecoverStalledSyncTarget(t.Context(), volPvc1); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"drbdadm disconnect " + volPvc1,
+		"drbdadm connect --discard-my-data " + volPvc1,
+	}
+	if !slices.Equal(fe.calls, want) {
+		t.Fatalf("want %v, got %v", want, fe.calls)
+	}
+}
+
+func TestRecoverStalledSyncTargetStopsWhenDisconnectFails(t *testing.T) {
+	fe := &fakeExec{errOn: map[string]error{
+		"drbdadm disconnect " + volPvc1: errors.New("busy"),
+	}}
+	d := &Driver{StateDir: t.TempDir(), Exec: fe.run, Mknod: fakeMknod}
+	if err := d.RecoverStalledSyncTarget(t.Context(), volPvc1); err == nil {
+		t.Fatal("expected disconnect failure")
+	}
+	if len(fe.calls) != 1 || fe.calls[0] != "drbdadm disconnect "+volPvc1 {
+		t.Fatalf("connect must not run after disconnect failure, got %v", fe.calls)
+	}
 }
 
 // A fully in-sync volume reports ResyncPercent 100, and connection-level

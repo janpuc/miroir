@@ -232,7 +232,7 @@ func realDevNumber(path string) (uint64, bool, error) {
 	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
 		return 0, false, nil
 	}
-	return st.Rdev, true, nil
+	return uint64(st.Rdev), true, nil //nolint:unconvert
 }
 
 // freezeIoctl opens the mountpoint and issues the freeze/thaw ioctl.

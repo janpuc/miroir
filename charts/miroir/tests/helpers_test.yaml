@@ -109,7 +109,7 @@ tests:
       # the name-semver shape rather than a hardcoded version.
       - matchRegex:
           path: metadata.labels["helm.sh/chart"]
-          pattern: ^miroir-\d+\.\d+\.\d+$
+          pattern: ^miroir-\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$
       - equal:
           path: metadata.labels["app.kubernetes.io/component"]
           value: controller

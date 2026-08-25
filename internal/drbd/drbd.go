@@ -962,6 +962,19 @@ func (d *Driver) CyclePeerConnection(ctx context.Context, name string, peerID in
 	return nil
 }
 
+// RecoverStalledSyncTarget restarts every connection while declaring the
+// local Inconsistent leg the loser. The caller must confirm that this node is
+// an active SyncTarget of an UpToDate peer whose transfer stopped progressing.
+func (d *Driver) RecoverStalledSyncTarget(ctx context.Context, name string) error {
+	if _, err := d.adm(ctx, "disconnect", name); err != nil {
+		return fmt.Errorf("disconnect %s: %w", name, err)
+	}
+	if _, err := d.adm(ctx, "connect", "--discard-my-data", name); err != nil {
+		return fmt.Errorf("connect --discard-my-data %s: %w", name, err)
+	}
+	return nil
+}
+
 // WipeMetadata destroys the DRBD metadata on a backing device so it cannot
 // carry a stale generation identifier into a reuse. The resource must be
 // down first — drbdmeta refuses an attached device. Callers treat it as
@@ -1244,7 +1257,14 @@ const (
 	replVerifyS     = "VerifyS"
 	replVerifyT     = "VerifyT"
 	replWFBitMapS   = "WFBitMapS"
+	replSyncTarget  = "SyncTarget"
 )
+
+// ResyncProgress is the target-side transfer progress reported for one peer.
+type ResyncProgress struct {
+	OutOfSyncKiB int64
+	ReceivedKiB  int64
+}
 
 // Status reports this node's view of one resource.
 type Status struct {
@@ -1292,6 +1312,10 @@ type Status struct {
 	// drbdsetup reports it) — the data-loss exposure if the healthiest
 	// peer is lost. Grows while a peer is down with no resync running.
 	OutOfSyncKiB int64
+	// SyncTargetPeers holds active, unsuspended target-side transfers from an
+	// UpToDate peer. The agent compares their received counters across polls to
+	// distinguish a real resync from DRBD stuck in SyncTarget without I/O.
+	SyncTargetPeers map[int32]ResyncProgress
 	// StuckResyncPeers holds the DRBD node ids of peers wearing the
 	// stranded-bitmap signature: connection Connected, replication
 	// Established or WFBitMapS, peer-disk Consistent, out-of-sync above
@@ -1340,8 +1364,17 @@ type jsonStatus struct {
 			PeerDiskState    string  `json:"peer-disk-state"`
 			PercentInSync    float64 `json:"percent-in-sync"`
 			OutOfSyncKiB     int64   `json:"out-of-sync"`
+			ReceivedKiB      int64   `json:"received"`
+			ResyncSuspended  string  `json:"resync-suspended"`
 		} `json:"peer_devices"`
 	} `json:"connections"`
+}
+
+func activeSyncTarget(connectionState string, replicationState string, peerDiskState string,
+	resyncSuspended string, outOfSyncKiB int64,
+) bool {
+	return connectionState == connConnected && replicationState == replSyncTarget &&
+		peerDiskState == DiskUpToDate && resyncSuspended == "no" && outOfSyncKiB > 0
 }
 
 // wedgeSignature reports the kernel view of a teardown that cannot make
@@ -1413,6 +1446,16 @@ func (d *Driver) Status(ctx context.Context, name string) (Status, error) {
 				}
 			}
 			s.OutOfSyncKiB = max(s.OutOfSyncKiB, pd.OutOfSyncKiB)
+			if activeSyncTarget(c.ConnectionState, pd.ReplicationState, pd.PeerDiskState,
+				pd.ResyncSuspended, pd.OutOfSyncKiB) {
+				if s.SyncTargetPeers == nil {
+					s.SyncTargetPeers = map[int32]ResyncProgress{}
+				}
+				s.SyncTargetPeers[c.PeerNodeID] = ResyncProgress{
+					OutOfSyncKiB: pd.OutOfSyncKiB,
+					ReceivedKiB:  pd.ReceivedKiB,
+				}
+			}
 			// Out-of-sync bits toward a connected peer with no resync
 			// running and the peer-disk parked Consistent: a bitmap DRBD
 			// armed and abandoned (issue #390). The race's terminal shape

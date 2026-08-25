@@ -1,8 +1,8 @@
 # miroir
 
-![Version](https://img.shields.io/static/v1?label=Version&message=0.11.23&color=informational&style=flat-square) <!-- x-release-please-version -->
+![Version](https://img.shields.io/static/v1?label=Version&message=0.11.23-janpuc.1&color=informational&style=flat-square) <!-- x-release-please-version -->
 ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.11.23&color=informational&style=flat-square) <!-- x-release-please-version -->
+![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.11.23-janpuc.1&color=informational&style=flat-square) <!-- x-release-please-version -->
 
 Replicated block storage for small Kubernetes clusters — CSI on LVM thin, ZFS, or loopfile backends with synchronous DRBD9 replication
 
@@ -173,7 +173,7 @@ Kubernetes: `>=1.31.0-0`
 | sidecars.snapshotter.timeout | string | `"120s"` |  |
 | storageCapacity.enabled | bool | `false` |  |
 | uninstall.confirmation | string | `""` | Consent to destroy all volume data on `helm uninstall`: set to the literal "yes-really-destroy-data" to render the pre-delete hook Job that deletes every MiroirSnapshot and MiroirVolume — the agents then tear down each DRBD resource and backing device, including volumes whose PV reclaimPolicy is Retain. Hooks are baked into the release at install/upgrade time, so set this with a `helm upgrade` *before* running `helm uninstall`. Any other non-empty value fails the render. |
-| uninstall.image | string | `"registry.k8s.io/kubectl:v1.36.3"` | Image for the uninstall hook Job (needs only `kubectl`). |
+| uninstall.image | string | `"registry.k8s.io/kubectl:v1.36.4"` | Image for the uninstall hook Job (needs only `kubectl`). |
 | unreachableNodeTolerationSeconds | int | `5` | Seconds the controller pod stays bound to an unreachable node before eviction. The Kubernetes default (300) leaves a single-replica controller unable to provision, expand, or snapshot for five minutes after its node dies; 5 reschedules it almost immediately (the controller is stateless). |
 
 ---
