@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.23-janpuc.2](https://github.com/janpuc/miroir/compare/0.11.23-janpuc.1...0.11.23-janpuc.2) (2026-08-27)
+
+
+### Bug Fixes
+
+* **csi:** stop deletion-targeted volumes from holding the overcommit budget
+
 ## [0.11.23-janpuc.1](https://github.com/janpuc/miroir/compare/0.11.23...0.11.23-janpuc.1) (2026-08-25)
 
 

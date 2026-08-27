@@ -1027,10 +1027,22 @@ type nodePool struct {
 // from a pre-fetched volume list, excluding the named volume (the one being
 // (re)created, so an idempotent retry does not count itself). Clones share
 // backing on disk but are counted in full — a conservative overcommit guard.
+//
+// Deletion-targeted volumes drop out. The virtual bound exists to cap how
+// much a pool's thin legs can still fill (see poolHeadroom), and a volume
+// carrying a DeletionTimestamp has no consumer left to write to it, so its
+// future growth is zero. Whatever it still occupies is already in the pool's
+// AllocatedBytes and thus bounded by poolHeadroom's physical term, so
+// counting its full provisioned size here charges the budget twice for space
+// that can never grow. Without this, a teardown the kernel cannot finish — a
+// leaked freeze pins the minor until the node reboots (issue #311) — holds
+// its entire provisioned size out of the admission budget for as long as the
+// zombie lives, and enough of them refuse provisioning pool-wide while the
+// pool itself sits physically near-empty.
 func provisionedPerPool(vols []miroirv1alpha1.MiroirVolume, exclude string) map[nodePool]int64 {
 	out := map[nodePool]int64{}
 	for _, v := range vols {
-		if v.Name == exclude {
+		if v.Name == exclude || !v.DeletionTimestamp.IsZero() {
 			continue
 		}
 		for _, r := range v.Spec.Replicas {
