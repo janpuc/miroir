@@ -15,12 +15,16 @@ run = "mise run helm-docs && git add charts/miroir/README.md charts/miroir/value
 
 # The generated chart README is .prettierignore'd (helm-docs owns it); keep it out
 # of the shared markdown formatter's file list too, or a commit staging only it
-# hands oxfmt an all-ignored set and it exits non-zero.
+# hands oxfmt an all-ignored set and it exits non-zero. CHANGELOG.md is
+# .prettierignore'd for the same reason (release-please owns it), and a release
+# bump stages it with no other markdown — the all-ignored case exactly.
 [pre-commit.commands.format-markdown]
-exclude = ["charts/miroir/README.md"]
+exclude = ["charts/miroir/README.md", "CHANGELOG.md"]
 
+# Likewise .release-please-manifest.json: .prettierignore'd, and the only JSON a
+# release bump stages.
 [pre-commit.commands.format-json]
-exclude = ["charts/miroir/values.schema.json"]
+exclude = ["charts/miroir/values.schema.json", ".release-please-manifest.json"]
 
 # Generated CRD/RBAC YAMLs are .prettierignore'd; exclude them here too, or a
 # commit staging only generated YAML feeds oxfmt an all-ignored input list and
