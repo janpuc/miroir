@@ -63,6 +63,19 @@ func volOn(name, node string, sizeBytes int64) *miroirv1alpha1.MiroirVolume {
 	}
 }
 
+// terminatingVolOn is a volume whose deletion has been requested but whose
+// teardown has not finished — the state a leaked-freeze zombie parks in
+// until the node reboots. The finalizer is what keeps the fake client from
+// reaping it on creation, and mirrors the real teardown finalizer that
+// holds the object.
+func terminatingVolOn(name, node string, sizeBytes int64) *miroirv1alpha1.MiroirVolume {
+	v := volOn(name, node, sizeBytes)
+	now := metav1.Now()
+	v.DeletionTimestamp = &now
+	v.Finalizers = []string{constants.FinalizerPrefix + node}
+	return v
+}
+
 func placementClient(s *runtime.Scheme, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 }
@@ -169,6 +182,53 @@ func TestPlaceRefusesOvercommit(t *testing.T) {
 	_, err := c.place(t.Context(), placeNodes(t, c), nil, 1, 10*gib, volNew, placementVols(t, c.Client), false, poolDefault, nil)
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("overcommit must be ResourceExhausted, got %v", err)
+	}
+}
+
+// A deletion-targeted volume cannot grow, so it must not hold admission
+// budget: its residual bytes are already counted physically via the pool's
+// AllocatedBytes. Same shape as TestPlaceRefusesOvercommit — only the
+// blocking volume's terminating state differs, and that must flip the
+// refusal into a placement.
+func TestPlaceIgnoresTerminatingVolumesInOvercommit(t *testing.T) {
+	s := newScheme(t)
+	c := &Controller{
+		Client: placementClient(s,
+			miroirNodeObj(nodeA, 10*gib, 0),
+			miroirNodeObj(nodeB, 10*gib, 0),
+			terminatingVolOn("zombie-k", nodeA, 15*gib),
+			terminatingVolOn("zombie-p", nodeB, 15*gib),
+		),
+		Nodes: testNodes,
+	}
+
+	got, err := c.place(t.Context(), placeNodes(t, c), nil, 1, 10*gib, volNew, placementVols(t, c.Client), false, poolDefault, nil)
+	if err != nil {
+		t.Fatalf("terminating volumes must not consume the overcommit budget: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one replica, got %+v", got)
+	}
+}
+
+// The exclusion is scoped to deletion — a live volume of the same size on
+// the same node still refuses, so the guard is not simply disabled.
+func TestPlaceStillRefusesOvercommitFromLiveVolumes(t *testing.T) {
+	s := newScheme(t)
+	c := &Controller{
+		Client: placementClient(s,
+			miroirNodeObj(nodeA, 10*gib, 0),
+			miroirNodeObj(nodeB, 10*gib, 0),
+			terminatingVolOn("zombie-k", nodeA, 15*gib),
+			volOn("live-p", nodeA, 15*gib),
+			volOn("live-q", nodeB, 15*gib),
+		),
+		Nodes: testNodes,
+	}
+
+	_, err := c.place(t.Context(), placeNodes(t, c), nil, 1, 10*gib, volNew, placementVols(t, c.Client), false, poolDefault, nil)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("live volumes must still bound admission, got %v", err)
 	}
 }
 
