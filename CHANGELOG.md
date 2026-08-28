@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.23-janpuc.4](https://github.com/janpuc/miroir/compare/0.11.23-janpuc.3...0.11.23-janpuc.4) (2026-08-28)
+
+
+### Bug Fixes
+
+* **agent:** stop a leaked filesystem freeze from needing a node reboot
+
 ## [0.11.23-janpuc.3](https://github.com/janpuc/miroir/compare/0.11.23-janpuc.2...0.11.23-janpuc.3) (2026-08-28)
 
 
