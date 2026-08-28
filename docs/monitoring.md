@@ -56,7 +56,7 @@ agent image's drbd-utils version (`utils_version` label), from
 client-only nodes too (which have no `MiroirNode` status). Query it
 for fleet version skew before a release raises the kernel floor.
 
-Three further node-scoped series cover the failure mode that
+Four further node-scoped series cover the failure mode that
 `miroir_volume_wedged` only ever sees one volume of at a time:
 
 | Metric                              | Meaning                                                                                                                           |
@@ -64,6 +64,7 @@ Three further node-scoped series cover the failure mode that
 | `miroir_node_stranded_children`     | host commands killed at their deadline whose task is still in uninterruptible sleep, so the kernel will neither run nor reap them |
 | `miroir_node_wedged`                | 1 while the node-scoped breaker is open: miroir has stopped spawning storage commands because each new one only strands too       |
 | `miroir_node_drbd_assertions_total` | fatal DRBD kernel assertions (`put_ldev` refcount underflows, LINBIT/drbd#137) sighted in the kernel log since the agent started  |
+| `miroir_node_abandoned_freezes`     | snapshot-barrier `FIFREEZE` ioctls miroir stopped waiting for at their deadline and the kernel has not yet completed              |
 
 A sustained non-zero `miroir_node_stranded_children` is the earliest
 signal that a node's storage stack is jamming: it climbs while the
@@ -94,6 +95,36 @@ so `miroir_node_wedged` holds 1 until the node reboots. Unmounts are
 not refused on a latch: the filesystem layer still works, and draining
 the node is exactly the remedy.
 
+A host command that outruns its deadline is killed, but a task in
+uninterruptible sleep never receives the signal, and waiting on it
+would block the caller for as long as the kernel holds it. miroir
+stops waiting after a short grace, counts the child in
+`miroir_node_stranded_children`, and fails the command with
+`command abandoned in uninterruptible sleep: node reboot required`.
+Teardowns park on that rather than retrying, because a retry only
+strands another task.
+
+`miroir_node_abandoned_freezes` is the same bound applied to snapshot
+barriers. `FIFREEZE` cannot be interrupted at all, so an abandoned
+freeze holds a goroutine — and the OS thread under it — until the
+device finishes its writeback. The count drains by itself as the
+ioctls return; while it sits at the cap, barriers on that node are
+refused instead of adding more. Sustained non-zero means a backing
+device cannot quiesce under its write load, and the shipped
+`MiroirNodeFreezeBacklog` rule alerts on it.
+
+One signal is not a `miroir_*` series at all. `MiroirAgentReconcileStalled`
+watches controller-runtime's own
+`workqueue_longest_running_processor_seconds`: a single reconcile that
+has held its worker for more than 15 minutes. That object is making no
+progress and the controller has one fewer worker for everything else —
+and crucially it reports _nothing_, no Event, no status write, no log
+line, because a reconcile that never returns never reaches a reporting
+path. Every per-volume gauge keeps its last value and ages silently.
+This queue-level view is the only one that sees it. Restarting the pod
+frees the worker; whether the underlying task drains is a separate
+question the node-scoped gauges above answer.
+
 For RWX volumes the **controller** exports `miroir_export_ready`: 1
 while the volume's NFS gateway is serving (gateway pod available,
 export address published). This is the signal the per-volume gauges
@@ -119,7 +150,8 @@ on their PVCs (`kubectl describe pvc`).
 all of the above (split-brain, quorum lost, stranded barrier, disk
 failed, a wedged teardown, degraded replication, sustained
 out-of-sync, an unavailable RWX export, a stale verify schedule,
-pool and thin-metadata usage, and a down agent). A node whose agent
+pool and thin-metadata usage, a stalled reconcile, a filesystem-freeze
+backlog, and a down agent). A node whose agent
 stops answering scrapes loses every `miroir_*` series, so none of
 its per-volume alerts can fire; the kernel-floor refusal to start
 looks exactly like this.

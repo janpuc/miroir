@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -43,6 +44,31 @@ const (
 // timeout is self-canceling (see Freeze), so the round can retry
 // without risking a filesystem left frozen with no owner.
 const freezeTimeout = 30 * time.Second
+
+// abandonedFreezeLimit is how many abandoned FIFREEZE ioctls may be
+// outstanding before Freeze refuses to issue another. Every abandoned call
+// holds its goroutine, and the OS thread under it, until the kernel finishes
+// the writeback it is blocked on; a device slow enough to miss the deadline
+// once will miss it again, so an uncapped barrier retry converts one
+// struggling filesystem into unbounded thread growth. Above one because a
+// single slow round must not disable snapshots node-wide.
+const abandonedFreezeLimit = 4
+
+// ErrFreezeBacklog marks a freeze refused because too many earlier ones are
+// still outstanding in the kernel. The barrier round parks on it exactly as
+// it parks on a freeze timeout; the count drains on its own as the ioctls
+// return, so no restart is needed.
+var ErrFreezeBacklog = errors.New("too many abandoned filesystem freezes on this node")
+
+// abandonedFreezes counts FIFREEZE ioctls abandoned at their deadline and
+// still outstanding. Node-scoped rather than per-Freezer: the agent builds
+// several Freezers (CSI node service, startup and shutdown drains) and they
+// all block on the same kernel.
+var abandonedFreezes atomic.Int64
+
+// AbandonedFreezes reports the outstanding abandoned-freeze count for the
+// node gauge.
+func AbandonedFreezes() int { return int(abandonedFreezes.Load()) }
 
 // Freezer freezes and thaws the filesystem mounted on a block device,
 // upgrading a snapshot cut from crash-consistent to
@@ -87,6 +113,9 @@ func (f *Freezer) Freeze(ctx context.Context, device string) (string, error) {
 	if err != nil || mp == "" {
 		return "", err
 	}
+	if abandonedFreezes.Load() >= abandonedFreezeLimit {
+		return "", fmt.Errorf("freeze %s (%s): %w", mp, device, ErrFreezeBacklog)
+	}
 	ctx, cancel := context.WithTimeout(ctx, freezeTimeout)
 	defer cancel()
 	done := make(chan error, 1)
@@ -101,7 +130,9 @@ func (f *Freezer) Freeze(ctx context.Context, device string) (string, error) {
 		}
 		return mp, nil
 	case <-ctx.Done():
+		abandonedFreezes.Add(1)
 		go func() {
+			defer abandonedFreezes.Add(-1)
 			if err := <-done; err == nil {
 				_ = f.ioctl(mp, fiThaw)
 			}

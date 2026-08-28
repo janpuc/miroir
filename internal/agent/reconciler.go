@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -1372,20 +1373,35 @@ func (r *VolumeReconciler) removeFinalizer(ctx context.Context, vol *miroirv1alp
 	return removeNodeFinalizer(ctx, r.Client, vol, r.NodeName)
 }
 
-// removeNodeFinalizer drops this node's teardown finalizer, swallowing
-// conflicts (the watch retriggers) and not-found (the object is already
-// gone — the goal state). Shared by the volume and snapshot reconcilers so
-// the subtle swallow semantics cannot drift apart.
+// removeNodeFinalizer drops this node's teardown finalizer, re-reading on
+// conflict and swallowing not-found (the object is already gone — the goal
+// state). Shared by the volume and snapshot reconcilers so the semantics
+// cannot drift apart.
+//
+// The conflict must be retried here rather than left to the watch. Every
+// replica's agent drops its own finalizer from the same deletion event, so
+// the losing writer's Update carries a stale resourceVersion — and the
+// writer that loses last has no peer write left to re-trigger it. Reporting
+// success there strands the finalizer, and the object holds in Terminating
+// with nothing scheduled to try again.
 func removeNodeFinalizer(ctx context.Context, c client.Client, obj client.Object, node string) error {
 	finalizer := constants.FinalizerPrefix + node
 	if !controllerutil.ContainsFinalizer(obj, finalizer) {
 		return nil
 	}
-	controllerutil.RemoveFinalizer(obj, finalizer)
-	if err := c.Update(ctx, obj); err != nil && !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
-		return err
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return err
+		}
+		if !controllerutil.RemoveFinalizer(obj, finalizer) {
+			return nil
+		}
+		return c.Update(ctx, obj)
+	})
+	if apierrors.IsNotFound(err) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 // wedgedRequeue spaces teardown retries of a kernel-wedged resource. The
@@ -1445,13 +1461,17 @@ func (r *VolumeReconciler) parkWithMessage(ctx context.Context, vol *miroirv1alp
 // reportBusy, anything else surfaces as a hard error. Every non-busy
 // outcome resets the busy streak.
 func (r *VolumeReconciler) handleTeardownError(ctx context.Context, vol *miroirv1alpha1.MiroirVolume, err error) (ctrl.Result, error) {
-	// backend.ErrNodeWedged rides the same path as drbd.ErrWedged: both mean
-	// this node cannot finish the teardown until it reboots. It must not fall
-	// through to clearWedged below — the node breaker refuses the status read
+	// backend.ErrNodeWedged and backend.ErrAbandoned ride the same path as
+	// drbd.ErrWedged: all three mean this node cannot finish the teardown
+	// until it reboots. ErrAbandoned is the single-command form — one child
+	// left in uninterruptible sleep — and parking it is what keeps the 10s
+	// busy cadence from stranding another task on every cycle. None may fall
+	// through to clearWedged below: the node breaker refuses the status read
 	// that Down needs to see the per-resource signature, so every wedged
 	// volume would otherwise report as recovered and delete the series the
 	// shipped critical alert pages on, exactly when the node is worst off.
-	if errors.Is(err, drbd.ErrWedged) || errors.Is(err, backend.ErrNodeWedged) {
+	if errors.Is(err, drbd.ErrWedged) || errors.Is(err, backend.ErrNodeWedged) ||
+		errors.Is(err, backend.ErrAbandoned) {
 		r.clearBusyFails(vol.Name)
 		return r.reportWedged(ctx, vol, err)
 	}

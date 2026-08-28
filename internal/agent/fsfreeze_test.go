@@ -279,3 +279,80 @@ func TestRawBlockBindNeverMatches(t *testing.T) {
 		t.Fatalf("raw-block volumes have nothing to freeze, got %q, %v", mp, err)
 	}
 }
+
+// resetAbandonedFreezes isolates the node-scoped counter between tests.
+func resetAbandonedFreezes(t *testing.T) {
+	t.Helper()
+	abandonedFreezes.Store(0)
+	t.Cleanup(func() { abandonedFreezes.Store(0) })
+}
+
+// An abandoned FIFREEZE holds its goroutine — and the OS thread under it —
+// until the kernel finishes the writeback, so the count has to rise when the
+// freeze is given up on and fall only once the ioctl really returns.
+func TestFreezeCountsAbandonedIoctlsUntilTheyReturn(t *testing.T) {
+	resetAbandonedFreezes(t)
+	rec := &ioctlRecorder{}
+	release := make(chan struct{})
+	f := testFreezer(rec)
+	inner := f.ioctl
+	f.ioctl = func(mp string, req uint) error {
+		if req == fiFreeze {
+			<-release
+		}
+		return inner(mp, req)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := f.Freeze(ctx, devDrbd1000); err == nil {
+		t.Fatal("a freeze past the deadline must fail the round")
+	}
+	if got := AbandonedFreezes(); got != 1 {
+		t.Fatalf("AbandonedFreezes() = %d, want 1 while the ioctl is still in the kernel", got)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for AbandonedFreezes() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("AbandonedFreezes() = %d, want 0 once the ioctl returned", AbandonedFreezes())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Past the cap the barrier must be refused rather than pile another
+// uninterruptible ioctl (and another pinned thread) onto a device that has
+// already proven it cannot quiesce in time.
+func TestFreezeRefusesPastTheAbandonedCap(t *testing.T) {
+	resetAbandonedFreezes(t)
+	abandonedFreezes.Store(abandonedFreezeLimit)
+	rec := &ioctlRecorder{}
+	f := testFreezer(rec)
+
+	mp, err := f.Freeze(t.Context(), devDrbd1000)
+	if !errors.Is(err, ErrFreezeBacklog) {
+		t.Fatalf("Freeze() error = %v, want ErrFreezeBacklog", err)
+	}
+	if mp != "" {
+		t.Fatalf("Freeze() mountpoint = %q, want empty when refused", mp)
+	}
+	if calls := rec.recorded(); len(calls) != 0 {
+		t.Fatalf("a refused freeze must not issue an ioctl, got %v", calls)
+	}
+}
+
+// The cap must not swallow freezes on a healthy node: one below the limit
+// still goes through.
+func TestFreezeProceedsBelowTheAbandonedCap(t *testing.T) {
+	resetAbandonedFreezes(t)
+	abandonedFreezes.Store(abandonedFreezeLimit - 1)
+	rec := &ioctlRecorder{}
+	f := testFreezer(rec)
+
+	if _, err := f.Freeze(t.Context(), devDrbd1000); err != nil {
+		t.Fatalf("Freeze() error = %v, want nil below the cap", err)
+	}
+	if calls := rec.recorded(); len(calls) != 1 {
+		t.Fatalf("Freeze() calls = %v, want exactly one freeze", calls)
+	}
+}

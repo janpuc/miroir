@@ -17,11 +17,14 @@ limitations under the License.
 package backend
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,6 +40,49 @@ type Exec func(ctx context.Context, name string, args ...string) (string, error)
 // D-state pins the single reconcile worker forever and head-of-line-blocks
 // every other volume on the node.
 const execTimeout = 2 * time.Minute
+
+// abandonGrace is how long Run keeps waiting for a killed child after its
+// deadline fired before giving up on it entirely.
+//
+// The deadline alone does not bound Run. exec.CommandContext sends SIGKILL
+// when ctx is done, but a task in uninterruptible sleep never receives it,
+// and Cmd.Wait calls Process.Wait (wait4) before it consults WaitDelay — so
+// Wait blocks until the child is reaped no matter what WaitDelay says.
+// WaitDelay only ever bounds the I/O copier goroutines, which Wait reaches
+// afterwards. Abandoning the child is the only thing that frees the caller:
+// otherwise one unkillable drbdsetup pins a reconcile worker for the life of
+// the process, and because the volume never reaches a reporting path it does
+// so with no log line, no Event and no status write.
+const abandonGrace = 10 * time.Second
+
+// ErrAbandoned marks a command Run stopped waiting for: the deadline fired,
+// the SIGKILL went unanswered, and the child is still in the kernel holding
+// whatever locks it took. The caller's goroutine is released; the child is
+// not. Callers must park rather than retry — a fast retry only spawns
+// another task that strands the same way.
+var ErrAbandoned = errors.New("command abandoned in uninterruptible sleep: node reboot required")
+
+// syncBuffer serialises the writes exec's copier goroutines make against
+// the reads Run does. CombinedOutput can share one plain bytes.Buffer
+// because Wait has joined those goroutines before it returns; an abandoned
+// child keeps its pipes open, so here they outlive Run and the buffer needs
+// its own lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // RealExec executes commands on the host without wedge tracking. The agent
 // container runs with the host namespaces, so lvm/zfs act on the node's
@@ -66,29 +112,76 @@ func (r *Runner) Run(ctx context.Context, name string, args ...string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, execTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	// A child stuck in D-state (wedged pool, frozen dm device) ignores the
-	// SIGKILL ctx cancellation sends and would pin CombinedOutput on its
-	// open pipes forever; WaitDelay makes Wait give up on them. It only
-	// arms once ctx is done, which is why the timeout above is required —
-	// the reconcile context is otherwise never cancelled.
-	cmd.WaitDelay = 10 * time.Second
+	// Bounds the copier goroutines once ctx is done, for the children that
+	// do die: without it they hold the pipes open and Wait never returns
+	// even after wait4 has. It cannot bound wait4 itself — see abandonGrace.
+	cmd.WaitDelay = abandonGrace
 	// Force the C locale: the delete/exists classifiers match lvm/zfs error
 	// text ("in use", "Failed to find", …), which the tools localise.
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
-	out, err := cmd.CombinedOutput()
+	var out syncBuffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("%s: %w", line, err)
+	}
+	// Read the pid now: after the abandon path returns, cmd is owned by the
+	// goroutine below and touching cmd.Process races it.
+	pid := cmd.Process.Pid
+	// Buffered so the goroutine can finish and exit whenever the kernel
+	// finally releases the child, long after Run has abandoned it.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	waitErr, abandoned := awaitChild(ctx, done, abandonGrace)
+	if abandoned {
+		// Recorded here rather than after the wait: an abandoned child is
+		// precisely what the breaker counts, and no code downstream of the
+		// wait can observe it — the wait is what never returns.
+		r.Wedge.note(pid, strings.TrimSpace(line))
+		return out.String(), fmt.Errorf("%s: %w: %s",
+			line, ErrAbandoned, strings.TrimSpace(out.String()))
+	}
+	return r.result(ctx, pid, line, out.String(), waitErr)
+}
+
+// awaitChild waits for done to carry the child's Wait result, allowing grace
+// past ctx's own expiry before reporting the child abandoned. Splitting the
+// two selects is what bounds Run: the outer one returns as soon as the child
+// does, and the inner one caps how long a child that ignored its SIGKILL can
+// hold the caller.
+func awaitChild(ctx context.Context, done <-chan error, grace time.Duration) (err error, abandoned bool) {
+	select {
+	case err := <-done:
+		return err, false
+	case <-ctx.Done():
+		// The kill is queued. A killable child dies in microseconds, so
+		// anything still here past the grace is not coming back.
+		select {
+		case err := <-done:
+			return err, false
+		case <-time.After(grace):
+			return nil, true
+		}
+	}
+}
+
+// result shapes one completed child's outcome, shared by the two paths that
+// can observe a Wait return so their error text and strand bookkeeping
+// cannot drift apart.
+func (r *Runner) result(ctx context.Context, pid int, line, out string, err error) (string, error) {
 	// Only a command we killed can have stranded a child, and a killable one
 	// is already gone by here. A child that did die frees its pid, so this
 	// read can in principle land on an unrelated task now holding it in D;
 	// that misread cannot latch, since Stranded re-checks every pid and
 	// tripping needs Limit outstanding at once.
-	if err != nil && ctx.Err() != nil && cmd.Process != nil {
-		r.Wedge.note(cmd.Process.Pid, strings.TrimSpace(line))
+	if err != nil && ctx.Err() != nil {
+		r.Wedge.note(pid, strings.TrimSpace(line))
 	}
 	if err != nil {
-		return string(out), fmt.Errorf("%s %s: %w: %s",
-			name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return out, fmt.Errorf("%s: %w: %s", line, err, strings.TrimSpace(out))
 	}
-	return string(out), nil
+	return out, nil
 }
 
 // Busy classifies a delete/destroy/down failure: it wraps err as ErrBusy
@@ -100,6 +193,11 @@ func (r *Runner) Run(ctx context.Context, name string, args ...string) (string, 
 func Busy(err error) error {
 	if err == nil {
 		return nil
+	}
+	// An abandoned child is never busy-retryable: the device it held is
+	// pinned in the kernel and the retry would strand another task.
+	if errors.Is(err, ErrAbandoned) {
+		return err
 	}
 	s := err.Error()
 	switch {

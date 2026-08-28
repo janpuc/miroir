@@ -188,6 +188,12 @@ var (
 		Name: "miroir_node_stranded_children",
 		Help: "Host commands miroir killed at their deadline whose task is still in uninterruptible sleep, so the kernel will neither run nor reap them. Sustained non-zero means the node's storage stack is jamming; once it reaches the breaker limit miroir stops spawning storage commands and only a node reboot clears it.",
 	})
+	// Node-scoped for the same reason as metricStrandedChildren: every
+	// Freezer on the node blocks on one kernel.
+	metricAbandonedFreezes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "miroir_node_abandoned_freezes",
+		Help: "Filesystem freeze ioctls (FIFREEZE) miroir stopped waiting for at their deadline and that the kernel has not yet completed. Each one holds a goroutine and an OS thread until its writeback finishes. Sustained non-zero means a backing device is too slow to quiesce; once the count reaches the cap, snapshot barriers on this node are refused rather than adding more.",
+	})
 	metricNodeWedged = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "miroir_node_wedged",
 		Help: "1 while the node-scoped breaker is open: enough host commands have stranded in the kernel that miroir refuses to spawn more, because each further attempt strands another task and pushes the node further from a graceful reboot. Only a reboot clears the kernel state; restarting the agent just forgets the count and re-trips.",
@@ -201,6 +207,7 @@ func init() {
 		metricVerifyTimestamp, metricVerifyOutOfSyncBytes, metricPrimary, metricDisklessPrimary,
 		metricWedged, metricPoolCapacity, metricPoolAllocated, metricPoolMetaUsedRatio,
 		metricDRBDKernelInfo, metricStrandedChildren, metricNodeWedged,
+		metricAbandonedFreezes,
 	)
 }
 
@@ -210,6 +217,7 @@ func init() {
 func RecordNodeWedge(w *backend.Wedge) {
 	stranded := w.Stranded()
 	metricStrandedChildren.Set(float64(stranded))
+	metricAbandonedFreezes.Set(float64(AbandonedFreezes()))
 	metricNodeWedged.Set(0)
 	if w.Tripped() {
 		metricNodeWedged.Set(1)

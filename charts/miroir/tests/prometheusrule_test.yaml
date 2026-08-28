@@ -73,6 +73,24 @@ tests:
       - equal:
           path: spec.groups[3].rules[1].expr
           value: miroir_node_wedged == 1
+      - lengthEqual:
+          path: spec.groups[3].rules
+          count: 4
+      - equal:
+          path: spec.groups[3].rules[2].alert
+          value: MiroirAgentReconcileStalled
+      - equal:
+          path: spec.groups[3].rules[2].labels.severity
+          value: critical
+      - equal:
+          path: spec.groups[3].rules[3].alert
+          value: MiroirNodeFreezeBacklog
+      - equal:
+          path: spec.groups[3].rules[3].expr
+          value: miroir_node_abandoned_freezes > 0
+      - equal:
+          path: spec.groups[3].rules[3].labels.severity
+          value: warning
 
   - it: should omit the export rule group by default (RWX is opt-in)
     set:
@@ -220,6 +238,8 @@ tests:
       monitoring.prometheusRule.enabled: true
       monitoring.prometheusRule.overrides:
         MiroirAgentDown: { disabled: true }
+        MiroirAgentReconcileStalled: { disabled: true }
+        MiroirNodeFreezeBacklog: { disabled: true }
     asserts:
       - equal:
           path: spec.groups[2].name
@@ -237,6 +257,8 @@ tests:
       monitoring.prometheusRule.overrides:
         MiroirAgentDown: { disabled: true }
         MiroirNodeStorageWedged: { disabled: true }
+        MiroirAgentReconcileStalled: { disabled: true }
+        MiroirNodeFreezeBacklog: { disabled: true }
     asserts:
       - lengthEqual:
           path: spec.groups

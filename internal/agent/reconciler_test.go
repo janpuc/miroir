@@ -28,8 +28,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -4235,5 +4237,62 @@ func TestReconcileDRBDStatusProbeFailurePreservesLastProbedAt(t *testing.T) {
 	// Connected and DiskState must not have been overwritten with stale values.
 	if !st.Connected || st.DiskState != diskStateUpToDate {
 		t.Fatalf("Connected/DiskState must not be overwritten on probe failure: %+v", st)
+	}
+}
+
+// Every replica's agent drops its own finalizer from the same deletion event,
+// so all but one Update carries a stale resourceVersion. Reporting the
+// resulting conflict as success strands the finalizer: the writer that loses
+// last has no peer write left to re-trigger its reconcile, and the object
+// holds in Terminating with nothing scheduled to try again.
+func TestRemoveNodeFinalizerRetriesOnConflict(t *testing.T) {
+	s := newScheme(t)
+	v := vol(volPvc1, nodeA, nodeB)
+
+	var updates int
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(v).
+		WithStatusSubresource(&miroirv1alpha1.MiroirVolume{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+				opts ...client.UpdateOption) error {
+				updates++
+				if updates == 1 {
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: miroirv1alpha1.GroupVersion.Group, Resource: "miroirvolumes"},
+						obj.GetName(), errors.New("the object has been modified"))
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	if err := removeNodeFinalizer(t.Context(), c, v.DeepCopy(), nodeA); err != nil {
+		t.Fatalf("removeNodeFinalizer() error = %v, want nil once the retry lands", err)
+	}
+	if updates < 2 {
+		t.Fatalf("Update calls = %d, want the conflict to be retried", updates)
+	}
+
+	got := &miroirv1alpha1.MiroirVolume{}
+	if err := c.Get(t.Context(), types.NamespacedName{Name: volPvc1}, got); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(got.Finalizers, constants.FinalizerPrefix+nodeA) {
+		t.Fatalf("finalizers = %v, want this node's dropped", got.Finalizers)
+	}
+	if !slices.Contains(got.Finalizers, constants.FinalizerPrefix+nodeB) {
+		t.Fatalf("finalizers = %v, want the peer's left alone", got.Finalizers)
+	}
+}
+
+// A volume that vanished mid-teardown is the goal state, not an error.
+func TestRemoveNodeFinalizerToleratesDeletedObject(t *testing.T) {
+	s := newScheme(t)
+	v := vol(volPvc1, nodeA)
+	c := fake.NewClientBuilder().WithScheme(s).Build()
+
+	if err := removeNodeFinalizer(t.Context(), c, v, nodeA); err != nil {
+		t.Fatalf("removeNodeFinalizer() error = %v, want nil when the object is already gone", err)
 	}
 }

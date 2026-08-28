@@ -372,7 +372,7 @@ spec:
     {{- end }}
 
     {{- /* Keep in sync with the rules below. */}}
-    {{- $agentAlerts := list "MiroirAgentDown" "MiroirNodeStorageWedged" }}
+    {{- $agentAlerts := list "MiroirAgentDown" "MiroirNodeStorageWedged" "MiroirAgentReconcileStalled" "MiroirNodeFreezeBacklog" }}
     {{- if include "miroir.anyAlertEnabled" (dict "root" $ "alerts" $agentAlerts) }}
     - name: miroir.agents
       rules:
@@ -421,6 +421,61 @@ spec:
               already staged keep serving I/O; teardowns, snapshots and
               unmounts on this node fail until it reboots. Drain and reboot
               the node.
+            {{- with .Values.monitoring.prometheusRule.additionalRuleAnnotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- end }}
+
+        {{- $rule = dict "root" $ "alert" "MiroirAgentReconcileStalled" "severity" "critical" "for" "5m" }}
+        {{- if include "miroir.alertEnabled" $rule }}
+        - alert: MiroirAgentReconcileStalled
+          expr: workqueue_longest_running_processor_seconds{namespace="{{ .Release.Namespace }}"} > 900
+          {{- with include "miroir.alertRuleFor" $rule }}
+          for: {{ . }}
+          {{- end }}
+          labels:
+            {{- include "miroir.alertRuleLabels" $rule | nindent 12 }}
+          annotations:
+            summary: >-
+              miroir {{ "{{" }} $labels.name {{ "}}" }} reconcile on
+              {{ "{{" }} $labels.node {{ "}}" }} has been running for
+              {{ "{{" }} $value | humanizeDuration {{ "}}" }}
+            description: >-
+              A single reconcile has held its worker far longer than any
+              healthy pass takes, so that object is making no progress and
+              the controller has one fewer worker for everything else. An
+              object stalled this way reports nothing at all — no Event, no
+              status write, no log line — because it never reaches a
+              reporting path, which is why this queue-level signal is the one
+              that catches it. Usually a host command stuck in the kernel:
+              check miroir_node_stranded_children and the agent logs on that
+              node, then restart the pod to free the worker.
+            {{- with .Values.monitoring.prometheusRule.additionalRuleAnnotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- end }}
+
+        {{- $rule = dict "root" $ "alert" "MiroirNodeFreezeBacklog" "severity" "warning" "for" "15m" }}
+        {{- if include "miroir.alertEnabled" $rule }}
+        - alert: MiroirNodeFreezeBacklog
+          expr: miroir_node_abandoned_freezes > 0
+          {{- with include "miroir.alertRuleFor" $rule }}
+          for: {{ . }}
+          {{- end }}
+          labels:
+            {{- include "miroir.alertRuleLabels" $rule | nindent 12 }}
+          annotations:
+            summary: >-
+              {{ "{{" }} $value {{ "}}" }} filesystem freeze(s) on
+              {{ "{{" }} $labels.node {{ "}}" }} are still outstanding in the
+              kernel
+            description: >-
+              Snapshot barriers issued FIFREEZE calls that missed their
+              deadline and cannot be interrupted; each one holds a goroutine
+              and an OS thread until its writeback completes. The backing
+              device is too slow to quiesce under load. Barriers on this node
+              are refused once the count reaches the cap; the count drains on
+              its own as the ioctls return.
             {{- with .Values.monitoring.prometheusRule.additionalRuleAnnotations }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
