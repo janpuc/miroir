@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.24-janpuc.2](https://github.com/janpuc/miroir/compare/0.11.23-janpuc.2...0.11.24-janpuc.2) (2026-08-28)
+
+
+### Bug Fixes
+
+* **agent:** stop unkillable host commands from pinning a reconcile worker ([90c5197](https://github.com/janpuc/miroir/commit/90c519746b9bc3701562f7cdaa282ca70886fe37))
+
 ## [0.11.23-janpuc.2](https://github.com/janpuc/miroir/compare/0.11.23-janpuc.1...0.11.23-janpuc.2) (2026-08-27)
 
 
