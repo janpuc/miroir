@@ -215,8 +215,12 @@ func TestThawMountpointThawsTheStagingMount(t *testing.T) {
 	rec := &ioctlRecorder{}
 	f := testFreezer(rec)
 	target := "/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/abc/globalmount"
-	if err := f.ThawMountpoint(target); err != nil {
+	clear, err := f.ThawMountpoint(target)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !clear {
+		t.Fatal("a thawed staging mount must report clear so unstage may unmount it")
 	}
 	if calls := rec.recorded(); len(calls) != 1 || calls[0] != "thaw "+target {
 		t.Fatalf("unexpected ioctls: %v", calls)
@@ -229,8 +233,12 @@ func TestThawMountpointSkipsNonMountpoint(t *testing.T) {
 	// An unstage retry after the unmount already happened: the target is
 	// no longer in mountinfo, and an ioctl against a plain directory would
 	// reach whatever filesystem holds it.
-	if err := f.ThawMountpoint("/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/gone/globalmount"); err != nil {
+	clear, err := f.ThawMountpoint("/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/gone/globalmount")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !clear {
+		t.Fatal("nothing mounted at target strands no freeze; unstage must not be blocked")
 	}
 	if len(rec.recorded()) != 0 {
 		t.Fatalf("no ioctl may run against a non-mountpoint: %v", rec.recorded())
@@ -242,8 +250,12 @@ func TestThawMountpointSkipsNonBlockMounts(t *testing.T) {
 	f := testFreezer(rec)
 	// A devtmpfs/NFS-style mount (major 0) can never wear a bdev freeze,
 	// and opening a dead hard-NFS mountpoint would hang — never touch it.
-	if err := f.ThawMountpoint("/var/lib/kubelet/pods/y/volumeDevices/pvc-2"); err != nil {
+	clear, err := f.ThawMountpoint("/var/lib/kubelet/pods/y/volumeDevices/pvc-2")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !clear {
+		t.Fatal("a non-block mount carries no bdev freeze; unstage must not be blocked")
 	}
 	if len(rec.recorded()) != 0 {
 		t.Fatalf("no ioctl may run against a non-block mount: %v", rec.recorded())
@@ -253,16 +265,24 @@ func TestThawMountpointSkipsNonBlockMounts(t *testing.T) {
 func TestThawMountpointToleratesNotFrozen(t *testing.T) {
 	rec := &ioctlRecorder{errs: []error{unix.EINVAL}}
 	f := testFreezer(rec)
-	if err := f.ThawMountpoint("/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/abc/globalmount"); err != nil {
+	clear, err := f.ThawMountpoint("/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/abc/globalmount")
+	if err != nil {
 		t.Fatalf("EINVAL (not frozen) must be a success: %v", err)
+	}
+	if !clear {
+		t.Fatal("a filesystem the kernel says was never frozen is clear")
 	}
 }
 
 func TestThawMountpointSurfacesRealErrors(t *testing.T) {
 	rec := &ioctlRecorder{errs: []error{errors.New("io error")}}
 	f := testFreezer(rec)
-	if err := f.ThawMountpoint("/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/abc/globalmount"); err == nil {
+	clear, err := f.ThawMountpoint("/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/abc/globalmount")
+	if err == nil {
 		t.Fatal("a real thaw failure must surface")
+	}
+	if clear {
+		t.Fatal("a failed thaw must not report clear: unmounting then strands the device until reboot")
 	}
 }
 
@@ -354,5 +374,45 @@ func TestFreezeProceedsBelowTheAbandonedCap(t *testing.T) {
 	}
 	if calls := rec.recorded(); len(calls) != 1 {
 		t.Fatalf("Freeze() calls = %v, want exactly one freeze", calls)
+	}
+}
+
+// The switch removes the uninterruptible ioctl from the round entirely —
+// that is the whole point, so it must not merely ignore the result.
+func TestFreezeDisabledIssuesNoIoctl(t *testing.T) {
+	resetAbandonedFreezes(t)
+	rec := &ioctlRecorder{}
+	f := testFreezer(rec)
+	f.DisableFreeze = true
+
+	mp, err := f.Freeze(t.Context(), devDrbd1000)
+	if err != nil {
+		t.Fatalf("Freeze() error = %v, want nil when disabled", err)
+	}
+	if mp != "" {
+		t.Fatalf("Freeze() mountpoint = %q, want empty so the round's close has nothing to thaw", mp)
+	}
+	if calls := rec.recorded(); len(calls) != 0 {
+		t.Fatalf("a disabled freeze must issue no ioctl, got %v", calls)
+	}
+}
+
+// Thawing stays live with the switch off: a freeze leaked while it was on
+// still has to be liftable, and that is the only path that clears one.
+func TestThawStillWorksWhenFreezeDisabled(t *testing.T) {
+	rec := &ioctlRecorder{}
+	f := testFreezer(rec)
+	f.DisableFreeze = true
+
+	if _, err := f.Thaw(devDrbd1000); err != nil {
+		t.Fatalf("Thaw() error = %v, want nil", err)
+	}
+	target := "/var/lib/kubelet/plugins/kubernetes.io/csi/miroir/abc/globalmount"
+	clear, err := f.ThawMountpoint(target)
+	if err != nil || !clear {
+		t.Fatalf("ThawMountpoint() = %v, %v; want true, nil", clear, err)
+	}
+	if calls := rec.recorded(); len(calls) != 2 {
+		t.Fatalf("both thaw paths must still issue their ioctl, got %v", calls)
 	}
 }

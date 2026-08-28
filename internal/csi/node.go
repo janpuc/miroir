@@ -81,7 +81,7 @@ type Node struct {
 // Thawer lifts a filesystem freeze from a staging mountpoint before its
 // unmount; *agent.Freezer implements it.
 type Thawer interface {
-	ThawMountpoint(target string) error
+	ThawMountpoint(target string) (bool, error)
 }
 
 // WedgeGate reports whether this node's storage stack has jammed badly
@@ -473,13 +473,22 @@ func (n *Node) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolume
 		return nil, status.Error(codes.InvalidArgument, "volume id and staging path are required")
 	}
 	// Lift any leaked snapshot-round freeze while the staging mount still
-	// exists: once the unmount below removes the last mountpoint, FITHAW
-	// has nothing left to open while the frozen device refuses every new
-	// mount — the catch-22 of issue #311. Best-effort: a failed thaw must
-	// never block unstage (the stage-time recovery is the backstop).
+	// exists, and refuse the unmount if that cannot be confirmed. Once the
+	// unmount below removes the last mountpoint, FITHAW has nothing left to
+	// open while the frozen device refuses every new mount, so the volume is
+	// stranded on this node until it reboots — the catch-22 of issue #311.
+	// There is no stage-time backstop for that state: the recovery there
+	// needs drbdsetup down, which the pinned open count is what refuses.
+	// A retrying unstage is recoverable (kubelet retries forever, the mount
+	// survives, and the agent's startup sweep can still thaw it); an
+	// unmounted frozen device is not.
 	if n.Freezer != nil {
-		if err := n.Freezer.ThawMountpoint(req.GetStagingTargetPath()); err != nil {
-			log.Error(err, "cannot thaw the staging mount before unstage", "volume", req.GetVolumeId())
+		thawed, err := n.Freezer.ThawMountpoint(req.GetStagingTargetPath())
+		if !thawed {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"refusing to unmount %s: its filesystem is frozen and could not be thawed (%v); "+
+					"unmounting would strand the device until the node reboots",
+				req.GetStagingTargetPath(), err)
 		}
 	}
 	if err := cleanupMount(req.GetStagingTargetPath(), n.Mounter, n.Wedge); err != nil {

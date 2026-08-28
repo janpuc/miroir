@@ -260,6 +260,13 @@ agent:
   # another controller owns node remediation and miroir should not write to
   # Node objects; doing so also drops `patch` on `nodes` from the agent's RBAC.
   wedgeTaint: true
+  # -- Quiesce a mounted filesystem with FIFREEZE before cutting its snapshot,
+  # making the snapshot filesystem-consistent instead of only crash-consistent.
+  # FIFREEZE cannot be interrupted, so a barrier against a device too slow to
+  # write back blocks until the kernel finishes it. Set false to fall back to
+  # the DRBD write barrier alone, which journaling filesystems replay on
+  # restore -- the way to remove that risk entirely on a struggling node.
+  freezeFilesystems: true
   # @schema
   # type: array
   # items:

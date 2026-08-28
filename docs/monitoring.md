@@ -107,11 +107,15 @@ strands another task.
 `miroir_node_abandoned_freezes` is the same bound applied to snapshot
 barriers. `FIFREEZE` cannot be interrupted at all, so an abandoned
 freeze holds a goroutine — and the OS thread under it — until the
-device finishes its writeback. The count drains by itself as the
-ioctls return; while it sits at the cap, barriers on that node are
-refused instead of adding more. Sustained non-zero means a backing
-device cannot quiesce under its write load, and the shipped
-`MiroirNodeFreezeBacklog` rule alerts on it.
+device finishes its writeback. While the count sits at the cap,
+barriers on that node are refused instead of adding more. It drains as
+the ioctls return, but a device that never completes its writeback
+never returns them, so the cap can hold until the agent restarts.
+Sustained non-zero means a backing device cannot quiesce under its
+write load; the shipped `MiroirNodeFreezeBacklog` rule alerts on it,
+and `agent.freezeFilesystems: false` removes the ioctl from the round
+entirely at the cost of crash-consistent rather than
+filesystem-consistent snapshots.
 
 One signal is not a `miroir_*` series at all. `MiroirAgentReconcileStalled`
 watches controller-runtime's own

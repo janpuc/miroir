@@ -53,3 +53,19 @@
   cycle. Point `spec.staging.storageClassName` at a `replicas: "1"`
   class naming the same pool, per
   [Stage kopiur backups unreplicated](quickstart.md#stage-kopiur-backups-unreplicated).
+- **Pods cannot mount, `blockdev is frozen` or `Device is held open by
+someone`**: a snapshot round's filesystem freeze outlived its thaw, so
+  the device's freeze count is pinned. The agent clears these on start —
+  its thaw sweep covers every leg placed on the node — so restarting the
+  agent pod on the affected node is the recovery:
+  `kubectl delete pod -n miroir-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=<node>`.
+  Unstage refuses to unmount a filesystem it could not thaw, which is what
+  keeps a mountpoint around for that sweep to use; an unstage stuck on
+  `refusing to unmount` is that guard working, not a separate fault. Only
+  a freeze already unmounted before this guard existed needs a node
+  reboot: `FITHAW` needs a mountpoint and a frozen device refuses every
+  new mount ([#311](https://github.com/home-operations/miroir/issues/311)).
+  On a node whose backing device is too slow to quiesce under load,
+  `agent.freezeFilesystems: false` drops the freeze from the round
+  entirely — snapshots become crash-consistent, which journaling
+  filesystems replay on restore.

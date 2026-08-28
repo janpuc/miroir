@@ -64,6 +64,7 @@ Kubernetes: `>=1.31.0-0`
 |-----|------|---------|-------------|
 | agent.extraArgs | list | `[]` | Extra arguments for the agent container. |
 | agent.extraEnv | list | `[]` | Extra environment variables for the agent container. |
+| agent.freezeFilesystems | bool | `true` | Quiesce a mounted filesystem with FIFREEZE before cutting its snapshot, making the snapshot filesystem-consistent instead of only crash-consistent. FIFREEZE cannot be interrupted, so a barrier against a device too slow to write back blocks until the kernel finishes it. Set false to fall back to the DRBD write barrier alone, which journaling filesystems replay on restore -- the way to remove that risk entirely on a struggling node. |
 | agent.image.digest | string | `""` |  |
 | agent.image.pullPolicy | string | `"IfNotPresent"` |  |
 | agent.image.repository | string | `"ghcr.io/home-operations/miroir-agent"` |  |

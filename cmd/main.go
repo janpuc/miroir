@@ -442,6 +442,7 @@ func main() {
 		verifySchedule    string
 		wedgeTaint        bool
 		peerFence         bool
+		freezeFilesystems bool
 
 		// gateway mode
 		volumeName  string
@@ -502,6 +503,12 @@ func main() {
 		"leave a wedged peer out of this node's rendered DRBD config so its kernel stops vetoing "+
 			"promotion here (agent; off by default — it changes DRBD membership from live peer "+
 			"state and wants validating against a real wedged node first)")
+	flag.BoolVar(&freezeFilesystems, "freeze-filesystems", true,
+		"quiesce a mounted filesystem with FIFREEZE before cutting its snapshot, making the "+
+			"snapshot filesystem-consistent rather than crash-consistent (agent). FIFREEZE cannot "+
+			"be interrupted, so a barrier on a device too slow to write back blocks until the "+
+			"kernel finishes; disable to fall back to the DRBD write barrier alone, which journaling "+
+			"filesystems recover from on restore")
 	flag.BoolVar(&wedgeTaint, "wedge-taint", true,
 		"taint this node "+constants.TaintStorageWedged+"=true:NoSchedule while its storage stack is "+
 			"wedged, so the scheduler stops placing consumers on a node that cannot mount them "+
@@ -759,7 +766,7 @@ func main() {
 			setupLog.Error(err, "unable to set up agent reconciler")
 			os.Exit(1)
 		}
-		freezer := agent.NewFreezer()
+		freezer := newSnapshotFreezer(freezeFilesystems)
 		addBarrierSweep(mgr, drbdReady, drbdDriver, freezer, nodeName)
 		snapReconciler := &agent.SnapshotReconciler{
 			Client:   mgr.GetClient(),
@@ -1112,6 +1119,19 @@ func sweepOrphans(nodeName string, driver *drbd.Driver) error {
 	return nil
 }
 
+// newSnapshotFreezer builds the freezer the snapshot rounds use. Only this
+// one honours the switch: the staging and sweep freezers share the type but
+// only ever thaw, and a freeze leaked while the switch was on has to stay
+// liftable after it is turned off.
+func newSnapshotFreezer(freezeFilesystems bool) *agent.Freezer {
+	f := agent.NewFreezer()
+	f.DisableFreeze = !freezeFilesystems
+	if !freezeFilesystems {
+		setupLog.Info("filesystem freeze disabled; snapshots will be crash-consistent")
+	}
+	return f
+}
+
 // resumeStaleBarriers lifts suspend-io left behind by a previous crash.
 // The kernel's view drives the sweep: a crash between suspend-io and the
 // status patch leaves a frozen device no snapshot records. Barriers whose
@@ -1165,58 +1185,59 @@ func resumeStaleBarriers(ctx context.Context, driver *drbd.Driver, freezer *agen
 			}
 		}
 	}
-	suspended, err := driver.UserSuspended(ctx)
-	if err != nil {
-		// No kernel view (e.g. module not loaded yet) also means nothing
-		// can be suspended — don't block agent startup on it.
-		setupLog.Error(err, "cannot list suspended resources; skipping barrier sweep")
-		return nil
-	}
-	var errs []error
-	var stale []string
-	for _, vol := range suspended {
-		if fresh[vol] {
-			continue
+	// No kernel view (e.g. module not loaded yet) also means nothing can be
+	// suspended. It skips the barrier resume only — the thaw sweep below
+	// reads the mount table, not the kernel's DRBD state, and it is the one
+	// pass that can still clear a leaked freeze.
+	if suspended, err := driver.UserSuspended(ctx); err != nil {
+		setupLog.Error(err, "cannot list suspended resources; skipping barrier resume")
+	} else {
+		var errs []error
+		for _, vol := range suspended {
+			if fresh[vol] {
+				continue
+			}
+			setupLog.Info("lifting stale IO barrier", "volume", vol)
+			if err := driver.ResumeIO(ctx, vol); err != nil {
+				errs = append(errs, fmt.Errorf("resume stale barrier on %s: %w", vol, err))
+			}
 		}
-		stale = append(stale, vol)
-		setupLog.Info("lifting stale IO barrier", "volume", vol)
-		if err := driver.ResumeIO(ctx, vol); err != nil {
-			errs = append(errs, fmt.Errorf("resume stale barrier on %s: %w", vol, err))
+		if err := errors.Join(errs...); err != nil {
+			setupLog.Error(err, "barrier resume sweep incomplete")
 		}
 	}
-	if err := errors.Join(errs...); err != nil {
-		setupLog.Error(err, "barrier resume sweep incomplete")
-	}
-	// A crash mid-round can leave the filesystem freeze behind exactly
-	// like the barrier; the reconcilers only thaw volumes whose snapshot
-	// objects still exist, so the sweep covers the rest. Fresh rounds
-	// keep their freeze — their own close lifts it.
-	if len(stale) > 0 && freezer != nil {
+	// A crash mid-round leaves the filesystem freeze behind, and it does
+	// not leave a stale barrier to find it by: the round runs freeze,
+	// suspend, cut, resume, thaw, so dying anywhere after the resume leaks
+	// a freeze with every barrier already lifted. The sweep therefore
+	// covers every leg placed on this node rather than the resumed ones.
+	// It is cheap and idempotent — a leg that is not mounted reports no
+	// mountpoint, and FITHAW on a filesystem that was never frozen answers
+	// EINVAL, which Thaw treats as success. Fresh rounds keep their freeze;
+	// their own close lifts it, and this runs before the manager starts so
+	// it cannot race a round this process drives.
+	if freezer != nil {
 		vols := &miroirv1alpha1.MiroirVolumeList{}
 		if err := listWithRetry(c, vols, apiBudget); err != nil {
 			setupLog.Error(err, "cannot list volumes; skipping freeze thaw sweep")
 			return nil
 		}
-		paths := map[string]string{}
 		for i := range vols.Items {
-			paths[vols.Items[i].Name] = vols.Items[i].Status.PerNode[nodeName].DevicePath
-		}
-		for _, name := range stale {
-			if device := paths[name]; device != "" {
-				mp, err := freezer.Thaw(device)
-				switch {
-				case err != nil:
-					setupLog.Error(err, "cannot thaw stale filesystem freeze", "volume", name)
-				case mp == "":
-					// Usually a leg that never froze (only mounted legs do),
-					// but a freeze leaked before its mount went away is
-					// unreachable now — mount refuses the frozen device and
-					// FITHAW needs a mountpoint (issue #311). Not silent, so
-					// the leak never looks like success; the stage-time
-					// recovery is what clears it.
-					setupLog.Info("stale barrier volume is not mounted; nothing to thaw here",
-						"volume", name, "device", device)
-				}
+			name := vols.Items[i].Name
+			if fresh[name] {
+				continue
+			}
+			device := vols.Items[i].Status.PerNode[nodeName].DevicePath
+			if device == "" {
+				continue
+			}
+			mp, err := freezer.Thaw(device)
+			switch {
+			case err != nil:
+				setupLog.Error(err, "cannot thaw leaked filesystem freeze", "volume", name)
+			case mp != "":
+				setupLog.V(1).Info("thawed any leaked filesystem freeze",
+					"volume", name, "mountpoint", mp)
 			}
 		}
 	}

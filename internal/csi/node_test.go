@@ -18,6 +18,7 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -565,15 +566,16 @@ func TestNodeUnstageForcesWhenVolumeGone(t *testing.T) {
 	}
 }
 
-// fakeThawer records thaw requests; err scripts a failure.
+// fakeThawer records thaw requests; err scripts a failure, which also
+// makes the thaw report unconfirmed.
 type fakeThawer struct {
 	targets []string
 	err     error
 }
 
-func (f *fakeThawer) ThawMountpoint(target string) error {
+func (f *fakeThawer) ThawMountpoint(target string) (bool, error) {
 	f.targets = append(f.targets, target)
-	return f.err
+	return f.err == nil, f.err
 }
 
 // Unstage must lift a leaked snapshot-round freeze while the staging
@@ -601,21 +603,6 @@ func TestNodeUnstageThawsBeforeUnmount(t *testing.T) {
 
 // A failed thaw must never block unstage — the stage-time frozen-bdev
 // recovery is the backstop for a freeze this best-effort lift missed.
-func TestNodeUnstageProceedsWhenThawFails(t *testing.T) {
-	target := t.TempDir()
-	n := newNode(t, stagedVolume(), fakeDRBDStatus{})
-	n.Mounter = mount.NewSafeFormatAndMount(
-		mount.NewFakeMounter([]mount.MountPoint{{Path: target}}), utilexec.New())
-	n.Freezer = &fakeThawer{err: context.DeadlineExceeded}
-
-	if _, err := n.NodeUnstageVolume(t.Context(), &csi.NodeUnstageVolumeRequest{
-		VolumeId:          volPvc1,
-		StagingTargetPath: target,
-	}); err != nil {
-		t.Fatalf("a failed thaw must not fail unstage: %v", err)
-	}
-}
-
 // fakeGate is an already-open breaker, so a test needs no real D-state child.
 type fakeGate struct {
 	err      error
@@ -778,5 +765,35 @@ func TestNodeUnstageDrainsOnLatchedBreaker(t *testing.T) {
 		StagingTargetPath: target,
 	}); err != nil {
 		t.Fatalf("a latched-only breaker must still let unstage drain workloads: %v", err)
+	}
+}
+
+// Unmounting a filesystem whose thaw failed strands the device until the
+// node reboots: FITHAW needs a mountpoint and a frozen bdev refuses every
+// new mount (issue #311), so there is no way back once the last mountpoint
+// is gone. A retrying unstage is the recoverable side of that trade —
+// kubelet retries forever, the mount survives, and the agent's startup
+// sweep can still thaw it.
+func TestNodeUnstageRefusesToUnmountAFrozenFilesystem(t *testing.T) {
+	target := t.TempDir()
+	n := newNode(t, stagedVolume(), fakeDRBDStatus{})
+	mounter := mount.NewFakeMounter([]mount.MountPoint{{Path: target}})
+	n.Mounter = mount.NewSafeFormatAndMount(mounter, utilexec.New())
+	n.Freezer = &fakeThawer{err: errors.New("device or resource busy")}
+
+	_, err := n.NodeUnstageVolume(t.Context(), &csi.NodeUnstageVolumeRequest{
+		VolumeId:          volPvc1,
+		StagingTargetPath: target,
+	})
+	if err == nil {
+		t.Fatal("unstage must fail rather than unmount a filesystem it could not thaw")
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("code = %s, want FailedPrecondition", got)
+	}
+	for _, a := range mounter.GetLog() {
+		if a.Action == mount.FakeActionUnmount {
+			t.Fatal("no unmount may run once the thaw is unconfirmed: it strands the device until reboot")
+		}
 	}
 }

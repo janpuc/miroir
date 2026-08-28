@@ -20,6 +20,12 @@
           "title": "extraEnv",
           "type": "array"
         },
+        "freezeFilesystems": {
+          "default": true,
+          "description": "Quiesce a mounted filesystem with FIFREEZE before cutting its snapshot,\nmaking the snapshot filesystem-consistent instead of only crash-consistent.\nFIFREEZE cannot be interrupted, so a barrier against a device too slow to\nwrite back blocks until the kernel finishes it. Set false to fall back to\nthe DRBD write barrier alone, which journaling filesystems replay on\nrestore -- the way to remove that risk entirely on a struggling node.",
+          "title": "freezeFilesystems",
+          "type": "boolean"
+        },
         "image": {
           "description": "Agent image (Debian + the lvm/zfs/drbd/mkfs userland the agent execs\non each storage node).",
           "properties": {

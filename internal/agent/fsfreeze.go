@@ -82,6 +82,16 @@ func AbandonedFreezes() int { return int(abandonedFreezes.Load()) }
 // mount. A device mounted more than once (staging plus pod binds)
 // shares one superblock; freezing any mountpoint freezes them all.
 type Freezer struct {
+	// DisableFreeze turns Freeze into a no-op, downgrading snapshots to the
+	// DRBD write barrier alone: crash-consistent rather than
+	// filesystem-consistent, which a journaling filesystem replays on
+	// restore. It exists because FIFREEZE cannot be interrupted, so the one
+	// way to be certain a barrier never blocks on a device that will not
+	// write back in time is not to issue it. Thawing is deliberately NOT
+	// gated on it — a freeze leaked before the switch was flipped still
+	// has to be liftable.
+	DisableFreeze bool
+
 	// mountinfo, devNumber and ioctl are the syscall surface, injectable
 	// in tests.
 	mountinfo func() ([]byte, error)
@@ -109,6 +119,11 @@ func NewFreezer() *Freezer {
 // be interrupted, so a watcher thaws the late freeze the moment it
 // lands: a failed Freeze never leaves the filesystem frozen.
 func (f *Freezer) Freeze(ctx context.Context, device string) (string, error) {
+	if f.DisableFreeze {
+		// "" is the same answer an unmounted leg gives: the round proceeds
+		// on the DRBD barrier alone and its close has nothing to thaw.
+		return "", nil
+	}
 	mp, err := f.mountpointOf(device)
 	if err != nil || mp == "" {
 		return "", err
@@ -161,18 +176,25 @@ func (f *Freezer) Thaw(device string) (string, error) {
 }
 
 // ThawMountpoint lifts a freeze on the block-device-backed filesystem
-// mounted at target; not a mountpoint and not frozen (EINVAL) are
-// successes, as it guards every staging unmount and those almost never
-// tear down a frozen filesystem. The unmount must run after it: once the
-// last mountpoint is gone, FITHAW has nothing left to open while the
-// frozen device refuses every new mount — the catch-22 of issue #311.
-// Only block-device mounts (mountinfo major != 0) are touched: opening a
+// mounted at target and reports whether that filesystem is confirmed
+// unfrozen afterwards. Callers must not unmount on a false: once the last
+// mountpoint is gone, FITHAW has nothing left to open while the frozen
+// device refuses every new mount, and the volume is stranded on this node
+// until it reboots — the catch-22 of issue #311. Holding a mount open is
+// always the recoverable side of that trade.
+//
+// Confirmed covers three shapes besides a successful thaw: nothing mounted
+// at target (no freeze can be stranded by unmounting what is not there),
+// a non-block mount (mountinfo major 0 — no bdev to pin, and opening a
 // dead hard-NFS mountpoint for the ioctl would hang exactly where the
-// unstage path's forced unmount cannot.
-func (f *Freezer) ThawMountpoint(target string) error {
+// unstage path's forced unmount cannot), and EINVAL, which is the kernel
+// saying the filesystem was not frozen to begin with.
+func (f *Freezer) ThawMountpoint(target string) (bool, error) {
 	data, err := f.mountinfo()
 	if err != nil {
-		return err
+		// The mount table is how this decides; unreadable is unverified,
+		// never "nothing to do".
+		return false, err
 	}
 	for line := range strings.Lines(string(data)) {
 		fields := strings.Fields(line)
@@ -180,14 +202,14 @@ func (f *Freezer) ThawMountpoint(target string) error {
 			continue
 		}
 		if maj, _, ok := strings.Cut(fields[2], ":"); !ok || maj == "0" {
-			return nil
+			return true, nil
 		}
 		if err := f.ioctl(target, fiThaw); err != nil && !errors.Is(err, unix.EINVAL) {
-			return fmt.Errorf("thaw %s: %w", target, err)
+			return false, fmt.Errorf("thaw %s: %w", target, err)
 		}
-		return nil
+		return true, nil
 	}
-	return nil
+	return true, nil
 }
 
 // mountpointOf finds the first mountpoint whose filesystem is backed by

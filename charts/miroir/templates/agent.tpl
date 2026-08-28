@@ -56,6 +56,7 @@ spec:
             - --pool-stats-interval={{ .Values.agent.poolStatsInterval }}
             - --volume-workers={{ .Values.agent.volumeWorkers }}
             - --wedge-taint={{ .Values.agent.wedgeTaint }}
+            - --freeze-filesystems={{ .Values.agent.freezeFilesystems }}
             - --peer-fence={{ .Values.agent.peerFence }}
             {{- if and .Values.drbd.verify.schedule (not .Values.drbd.verify.suspend) }}
             - --verify-schedule={{ .Values.drbd.verify.schedule }}
